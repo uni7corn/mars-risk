@@ -1,27 +1,94 @@
-import sys
+"""MARS 风险建模工具包的公开导出入口。"""
 
-__version__ = "0.0.2" 
+from .analysis import (
+    MarsBinEvaluator,
+    MarsDataProfiler,
+    MarsEvaluationReport,
+    MarsProfileConfig,
+    MarsProfileReport,
+    MarsRiskProfile,
+    profile_risk,
+    profile_stats,
+)
+from .feature import MarsLiteOptBinner, MarsNativeBinner, MarsOptimalBinner, MarsStatsSelector
+from .modeling import MarsModelingSession
+from .monitoring import (
+    MarsMonitor,
+    MarsMonitoringAlertConfig,
+    MarsMonitoringAlerter,
+    MarsMonitoringData,
+    MarsMonitoringReport,
+    generate_monitoring_alert,
+)
+from .pipeline import (
+    MarsModelingPipeline,
+    MarsModelingStep,
+    MarsPipelineResult,
+    MarsPipelineStep,
+    MarsSelectionStep,
+    MarsStepResult,
+    MarsWOEBinningStep,
+)
+from .scoring import MarsScorecard, build_scorecard
+from .utils import logger, set_log_level
 
-_BANNER = r"""
+__version__ = "0.0.16"
+
+_BANNER = rf"""
     __________________________________________________________________________
        __  ___ ___    ____  _____
       /  |/  //   |  / __ \/ ___/
-     / /|_/ // /| | / /_/ /\__ \ 
-    / /  / // ___ |/ _, _/___/ / 
-   /_/  /_//_/  |_/_/ |_|/____/  
-                                 
-    MODELING ANALYSIS RISK SCORE 
+     / /|_/ // /| | / /_/ /\__ \
+    / /  / // ___ |/ _, _/___/ /
+   /_/  /_//_/  |_/_/ |_|/____/
+
+    MODELING ANALYSIS RISK SCORE
     __________________________________________________________________________
-    Version: {ver} | Copyright (c) 2026 Christian Li
+    Version: {__version__} | Copyright (c) 2026 Christian Li
     High-performance Risk Modeling Toolkit powered by Polars
     __________________________________________________________________________
-""".format(ver=__version__)
+"""
 
-# if hasattr(sys, 'ps1') or 'ipykernel' in sys.modules:
-#     print(_BANNER)
 
-def __repr__():
+def __repr__() -> str:
+    """返回包级欢迎横幅字符串。"""
     return _BANNER
 
-def __str__():
+
+def __str__() -> str:
+    """返回包级欢迎横幅字符串。"""
     return _BANNER
+
+
+__all__ = [
+    "MarsDataProfiler",
+    "MarsProfileConfig",
+    "MarsProfileReport",
+    "MarsRiskProfile",
+    "MarsLiteOptBinner",
+    "MarsNativeBinner",
+    "MarsOptimalBinner",
+    "MarsBinEvaluator",
+    "MarsEvaluationReport",
+    "profile_stats",
+    "profile_risk",
+    "MarsStatsSelector",
+    "MarsModelingSession",
+    "MarsMonitor",
+    "MarsMonitoringAlertConfig",
+    "MarsMonitoringAlerter",
+    "MarsMonitoringData",
+    "MarsMonitoringReport",
+    "generate_monitoring_alert",
+    "MarsModelingPipeline",
+    "MarsModelingStep",
+    "MarsPipelineStep",
+    "MarsPipelineResult",
+    "MarsSelectionStep",
+    "MarsStepResult",
+    "MarsWOEBinningStep",
+    "MarsScorecard",
+    "build_scorecard",
+    "logger",
+    "set_log_level",
+]

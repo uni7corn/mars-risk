@@ -1,447 +1,2816 @@
-import polars as pl
-import pandas as pd
+"""MARS 数据画像与分箱评估报告对象。"""
+
+import html
+import importlib.util
+import json
+import os
+import sys
+from copy import copy
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+
 import numpy as np
-from typing import Dict, Tuple, Optional, Union, List, Any
+import pandas as pd
+import polars as pl
+
+from mars.analysis._html_assets import build_html_runtime_script, build_html_styles
+from mars.utils.frame import to_pandas_frame
+from mars.utils.html import format_html_value, is_missing_html_value
 from mars.utils.logger import logger
 
-try:
-    from IPython.display import display, HTML
-except ImportError:
-    display = None
 
-class MarsProfileReport:
+def _as_pandas_frame(df: Union[pl.DataFrame, pd.DataFrame]) -> pd.DataFrame:
     """
-    [报告容器] MarsProfileReport - 统一管理数据画像结果的展示与导出。
-    
-    该类作为 MarsDataProfiler 的输出容器，负责将原始的统计数据 (DataFrame)
-    转换为适合阅读分析的格式。它支持两种主要的输出渠道：
-    1. **Jupyter Notebook**: 生成富文本 HTML，包含交互式表格、热力图和迷你分布图。
-    2. **Excel 文件**: 导出带格式 (条件格式、数据条、百分比) 的 Excel 报表。
+    将展示层输入统一转换为 Pandas DataFrame。
+
+    Parameters
+    ----------
+    df : Union[pl.DataFrame, pd.DataFrame]
+        需要用于样式渲染或 Excel 导出的数据表。
+
+    Returns
+    -------
+    pd.DataFrame
+        转换后的 Pandas DataFrame。若输入本身已为 Pandas，则直接返回原对象。
+    """
+    return to_pandas_frame(df)
+
+class ProfileData(NamedTuple):
+    """
+    画像报告底层数据对象集合。
 
     Attributes
     ----------
-    overview_table : Union[pl.DataFrame, pd.DataFrame]
-        全量概览大宽表，包含所有特征的统计指标。
-    dq_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-        数据质量 (DQ) 指标的分组趋势表字典，key 为指标名 (如 'missing')。
-    stats_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-        统计指标的分组趋势表字典，key 为指标名 (如 'mean')。
+    overview : DataFrame
+        特征概览宽表。
+    dq_trends : dict of str to DataFrame
+        数据质量指标的趋势宽表字典。
+    stats_trends : dict of str to DataFrame
+        统计分布指标的趋势宽表字典。
+
+    Examples
+    --------
+    >>> import polars as pl
+    >>> data = ProfileData(overview=pl.DataFrame(), dq_trends={}, stats_trends={})
+    >>> data.dq_trends
+    {}
+    """
+
+    overview: Union[pl.DataFrame, pd.DataFrame]
+    dq_trends: Dict[str, Union[pl.DataFrame, pd.DataFrame]]
+    stats_trends: Dict[str, Union[pl.DataFrame, pd.DataFrame]]
+
+class MarsProfileReport:
+    """
+    数据特征画像与质量评估报告容器。
+
+    作为数据探查（EDA）流水线的标准输出载体，该组件负责统一管理并呈现由
+    `MarsDataProfiler` 产出的高维特征统计指标与多维趋势矩阵。系统封装了对底层
+    数据帧的只读访问接口、面向 Jupyter 环境的交互式富文本渲染，以及携带高保真
+    条件格式的跨平台电子表格（Excel）持久化导出能力。
+
+    Attributes
+    ----------
+    overview_table : DataFrame
+        内部持有的全量特征概览宽表上下文引用。
+
+    dq_tables : dict of str to DataFrame
+        内部持有的数据质量指标趋势字典上下文引用。
+
+    stats_tables : dict of str to DataFrame
+        内部持有的统计分布指标趋势字典上下文引用。
+
+    Notes
+    -----
+    该容器提供了针对数据质量探查与时序追踪的统一交互层 API。
+    其内部暴露的 `show_overview` 与 `show_trend` 方法通过动态构建级联的样式渲染器
+    （Pandas Styler），支持在交互式计算环境中直接将统计梯度映射为色带（Colormaps）、
+    数据条（Data Bars）及微缩分布字符图（Sparklines）。
+    调用持久化导出时，底层引擎将在物理存储层面上严格还原交互式环境中的条件格式规则，
+    以确保离线监控报表与线上分析环境的视觉一致性。
+
+    Examples
+    --------
+    >>> import polars as pl
+    >>> overview = pl.DataFrame({"feature": ["age"], "missing_rate": [0.0]})
+    >>> dq_tables = {"missing": pl.DataFrame({"feature": ["age"], "202601": [0.0]})}
+    >>> report = MarsProfileReport(overview, dq_tables=dq_tables, stats_tables={})
+    >>> overview_df, dq_dict, stat_dict = report.get_profile_data()
+    >>> overview_df.height
+    1
     """
 
     def __init__(
-        self, 
+        self,
         overview: Union[pl.DataFrame, pd.DataFrame],
         dq_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]],
         stats_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]]
     ) -> None:
         """
-        初始化报告容器。
+        初始化画像报告容器。
 
         Parameters
         ----------
         overview : Union[pl.DataFrame, pd.DataFrame]
-            全量概览表，包含特征名、类型、分布图及各类统计指标。
+            特征概览宽表。
         dq_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            数据质量 (DQ) 指标趋势表字典，包含缺失率、零值率等随分组维度的变化。
+            数据质量趋势表字典。
         stats_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            统计指标趋势表字典，包含均值、标准差等随分组维度的变化。
+            统计指标趋势表字典。
         """
-        self.overview_table: Union[pl.DataFrame, pd.DataFrame] = overview
-        self.dq_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]] = dq_tables
-        self.stats_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]] = stats_tables
+        self.overview_table = overview
+        self.dq_tables = dq_tables
+        self.stats_tables = stats_tables
 
-    def get_profile_data(self) -> Tuple[
-        Union[pl.DataFrame, pd.DataFrame], 
-        Dict[str, Union[pl.DataFrame, pd.DataFrame]], 
-        Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-    ]:
+        # 建立索引：将所有指标名映射到对应的数据源类型 ('dq' 或 'stat')
+        # 这允许我们在 show_trend 中快速定位
+        self._metric_index: Dict[str, str] = {}
+        for k in self.dq_tables.keys():
+            self._metric_index[k] = "dq"
+        for k in self.stats_tables.keys():
+            self._metric_index[k] = "stat"
+
+    def get_profile_data(self) -> ProfileData:
         """
-        [API] 获取纯净的原始数据对象。
-        
-        用于后续的特征筛选 (Selector)、自定义分析或将数据传入其他系统。
+        返回画像报告的原始数据对象。
 
         Returns
         -------
-        overview_df : Union[pl.DataFrame, pd.DataFrame]
-            全量概览大宽表。
-        dq_tables_dict : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            DQ 指标趋势字典。
-        stats_tables_dict : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
-            统计指标趋势字典。
+        ProfileData
+            包含概览表、数据质量趋势表字典和统计指标趋势表字典的命名元组。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> overview = pl.DataFrame({"feature": ["age"], "missing_rate": [0.0]})
+        >>> report = MarsProfileReport(overview, dq_tables={}, stats_tables={})
+        >>> report.get_profile_data().overview.height
+        1
         """
-        return self.overview_table, self.dq_tables, self.stats_tables
+        return ProfileData(
+            overview=self.overview_table,
+            dq_trends=self.dq_tables,
+            stats_trends=self.stats_tables
+        )
 
     def _repr_html_(self) -> str:
-        """
-        [Internal] Jupyter Notebook 的富文本展示接口。
-        
-        当在 Jupyter 环境中直接打印此对象时，生成一个交互式的 HTML 控制面板。
+        """返回 Jupyter 环境下的 HTML 摘要面板。"""
+        df_ov = self.overview_table
+        n_feats = len(df_ov) if hasattr(df_ov, "__len__") else df_ov.height
 
-        Returns
-        -------
-        str
-            包含概览统计信息和操作指南的 HTML 字符串。
-        """
-        df_ov: Union[pl.DataFrame, pd.DataFrame] = self.overview_table
-        
-        # 统计特征总数
-        n_feats: int = len(df_ov) if hasattr(df_ov, "__len__") else df_ov.height
-        
-        # 推断分组数量
-        sample_dq: Optional[Union[pl.DataFrame, pd.DataFrame]] = self.dq_tables.get('missing')
-        n_groups: int = 0
-        if sample_dq is not None:
-            n_cols: int = len(sample_dq.columns)
-            # 减去固定列: feature, dtype, total
-            n_groups = max(0, n_cols - 3)
+        dq_keys = list(self.dq_tables.keys())
+        stat_keys = list(self.stats_tables.keys())
 
-        # 构建控制面板内容
-        lines: List[str] = []
-        lines.append('<code>.show_overview()</code> 👈 <b>Full Overview (Recommended)</b>')
-        
-        dq_keys: List[str] = list(self.dq_tables.keys())
-        dq_links: List[str] = [f"<code>.show_dq('{k}')</code>" for k in dq_keys]
-        lines.append(f'DQ Trends: {", ".join(dq_links)}')
-        
-        stats_keys: List[str] = list(self.stats_tables.keys())
-        if stats_keys:
-            stat_links: List[str] = [f"<code>.show_trend('{k}')</code>" for k in stats_keys]
-            lines.append(f'Stats Trends: {", ".join(stat_links)}')
-        
-        lines.append('<code>.write_excel()</code> Export formatted report')
-        lines.append('<code>.get_profile_data()</code> Get raw data for feature selection')
+        # 样式定义 (Inline CSS for portability)
+        # 胶囊样式，用于包裹指标名
+        pill_style = (
+            "background-color: #e8f4f8; color: #2980b9; border: 1px solid #bce0eb; "
+            "padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; margin-right: 4px;"
+        )
+        # 代码块样式
+        code_style = (
+            "background-color: #f0f0f0; padding: 2px 4px; border-radius: 3px; "
+            "font-family: monospace; color: #e74c3c; font-weight: bold;"
+        )
 
+        # 辅助函数：生成指标徽章列表
+        def _fmt_pills(keys: list[str]) -> str:
+            """将指标名称渲染为 HTML 胶囊标签。"""
+            if not keys:
+                return "<span style='color:#ccc'>None</span>"
+            # 为了防止指标太多撑爆屏幕，限制显示数量 (例如只显示前 20 个，后面加 ...)
+            display_keys = keys[:30]
+            pills = "".join([f"<span style='{pill_style}'>'{k}'</span>" for k in display_keys])
+            if len(keys) > 30:
+                pills += f"<span style='color:#999; font-size:0.8em'> (+{len(keys)-30} more)</span>"
+            return pills
+
+        # 组装 HTML
         return f"""
-        <div style="border-left: 5px solid #2980b9; background-color: #f4f6f7; padding: 15px; border-radius: 0 5px 5px 0;">
-            <h3 style="margin:0 0 10px 0; color:#2c3e50;">📊 Mars Data Profile Report</h3>
-            <div style="display: flex; gap: 20px; margin-bottom: 10px; color: #555;">
-                <div><strong>🏷️ Features:</strong> {n_feats}</div>
-                <div><strong>📅 Groups:</strong> {n_groups}</div>
+        <div style="border: 1px solid #e0e0e0; border-left: 5px solid #2980b9; border-radius: 4px; background: white; max-width: 900px; font-family: 'Segoe UI', sans-serif;">
+
+            <div style="padding: 12px 15px; background-color: #f8f9fa; border-bottom: 1px solid #e0e0e0; display: flex; justify-content: space-between; align-items: center;">
+                <div style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">
+                    📊 Mars Data Profile
+                </div>
+                <div style="font-size: 0.85em; color: #7f8c8d;">
+                    <span style="margin-left: 15px;">🏷️ Features: <b>{n_feats}</b></span>
+                    <span style="margin-left: 15px;">🔍 DQ Metrics: <b>{len(dq_keys)}</b></span>
+                    <span style="margin-left: 15px;">📉 Stat Metrics: <b>{len(stat_keys)}</b></span>
+                </div>
             </div>
-            <div style="font-size:0.9em; line-height:1.8; color:#7f8c8d; border-top: 1px solid #e0e0e0; padding-top: 8px;">
-                { "<br>".join(lines) }
+
+            <div style="padding: 15px;">
+
+                <div style="margin-bottom: 15px;">
+                    <div style="font-size: 0.8em; text-transform: uppercase; color: #95a5a6; font-weight: bold; margin-bottom: 5px;">Quick Actions</div>
+                    <div style="display: flex; gap: 20px; font-size: 0.95em;">
+                        <div>👉 <span style="{code_style}">.show_overview()</span> &nbsp;<span style="color:#555">View Full Report</span></div>
+                        <div>💾 <span style="{code_style}">.write_excel()</span> &nbsp;<span style="color:#555">Export XLSX</span></div>
+                        <div>📥 <span style="{code_style}">.get_profile_data()</span> &nbsp;<span style="color:#555">Get Raw Data</span></div>
+                    </div>
+                </div>
+
+                <div style="border-top: 1px dashed #e0e0e0; padding-top: 12px;">
+                    <div style="font-size: 0.8em; text-transform: uppercase; color: #95a5a6; font-weight: bold; margin-bottom: 8px;">
+                        Trend Analysis <span style="font-weight:normal; text-transform:none; color:#bbb">(Use <code>.show_trend('metric_name')</code>)</span>
+                    </div>
+
+                    <div style="display: flex; margin-bottom: 8px; align-items: baseline;">
+                        <div style="width: 80px; font-weight: bold; color: #27ae60; font-size: 0.9em;">DQ:</div>
+                        <div style="flex: 1; line-height: 1.6;">
+                            {_fmt_pills(dq_keys)}
+                        </div>
+                    </div>
+
+                    <div style="display: flex; align-items: baseline;">
+                        <div style="width: 80px; font-weight: bold; color: #2980b9; font-size: 0.9em;">Stats:</div>
+                        <div style="flex: 1; line-height: 1.6;">
+                            {_fmt_pills(stat_keys)}
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <div style="padding: 6px 15px; background-color: #fff8e1; border-top: 1px solid #fae5b0; font-size: 0.8em; color: #d35400;">
+                💡 <b>Pro Tip:</b> Use <span style="{code_style}">.show_trend('psi')</span> to detect population stability drift.
             </div>
         </div>
         """
 
-    def show_overview(self) -> "pd.io.formats.style.Styler":
+    def show_overview(self,
+                      features: Union[str, List[str]] | None = None,
+                      sort_by: Union[str, List[str]] | None = None,
+                      sort_ascending: bool = False) -> "pd.io.formats.style.Styler":
         """
-        展示全量概览大宽表。
-        
-        采用 'RdYlGn_r' (红-黄-绿 反转) 色系展示数据质量指标：
-        - 高缺失率/高单一值率 -> 红色 (警示风险)
-        - 低缺失率 -> 绿色 (健康状态)
+        展示特征概览宽表。
 
-        Returns
-        -------
-        pd.io.formats.style.Styler
-            配置了热力图、迷你图样式和数值格式化的 Pandas Styler 对象。
-        """
-        return self._get_styler(
-            self.overview_table, 
-            title="Dataset Overview", 
-            cmap="RdYlGn_r", 
-            subset_cols=["missing_rate", "zeros_rate", "unique_rate", "top1_ratio"],
-            fmt_as_pct=False
-        )
-
-    def show_dq(self, metric: str) -> "pd.io.formats.style.Styler":
-        """
-        展示指定数据质量 (DQ) 指标的趋势表。
-        
         Parameters
         ----------
-        metric : str
-            DQ 指标名称，可选：'missing', 'zeros', 'unique', 'top1'。
+        features : Union[str, List[str]] | None
+            需要展示的特征名称。若为 ``None``，展示全部特征。
+        sort_by : Union[str, List[str]] | None
+            排序依据列。若为 ``None``，默认先按 ``dtype`` 再按 ``missing_rate`` 排序。
+        sort_ascending : bool
+            是否按 ``sort_by`` 升序排列。
 
         Returns
         -------
         pd.io.formats.style.Styler
-            针对百分比指标优化的 Pandas Styler 对象。
+            适合在 Jupyter 环境中直接渲染的样式化概览表。
 
-        Raises
-        ------
-        ValueError
-            当输入的指标名称不在 dq_tables 中时抛出。
+        Examples
+        --------
+        >>> import polars as pl
+        >>> overview = pl.DataFrame(
+        ...     {
+        ...         "feature": ["age"],
+        ...         "dtype": ["Int64"],
+        ...         "missing_rate": [0.0],
+        ...         "zeros_rate": [0.0],
+        ...         "unique_rate": [1.0],
+        ...         "top1_ratio": [0.25],
+        ...     }
+        ... )
+        >>> report = MarsProfileReport(overview, dq_tables={}, stats_tables={})
+        >>> hasattr(report.show_overview(features="age"), "to_html")
+        True
         """
-        if metric not in self.dq_tables:
-            raise ValueError(f"Unknown DQ metric: {metric}")
+        # 转换为 Pandas 副本以进行切片
+        df = _as_pandas_frame(self.overview_table).copy()
+
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
+
         return self._get_styler(
-            self.dq_tables[metric], 
-            title=f"DQ Trends: {metric}", 
+            df,
+            title="Dataset Overview",
             cmap="RdYlGn_r",
-            fmt_as_pct=True
+            sort_by= ["dtype"] + (["missing_rate"] if sort_by is None else ([sort_by] if isinstance(sort_by, str) else sort_by)),
+            sort_ascending=sort_ascending,
+            # 指定哪些列应用“红绿灯”配色 (高值=红)
+            subset_cols=["missing_rate", "zeros_rate", "unique_rate", "top1_ratio"],
+            fmt_as_pct=False # 概览表混合了多种类型，不强制全转百分比，由内部逻辑细分
         )
 
-    def show_trend(self, metric: str) -> "pd.io.formats.style.Styler":
+    def show_trend(self,
+                   metric: str,
+                   features: Union[str, List[str]] | None = None,
+                   group_ascending: bool = True,
+                   sort_by: Union[List[str], str] = "total",
+                   sort_ascending: bool = False) -> "pd.io.formats.style.Styler":
         """
-        展示指定统计指标的趋势表。
-        
-        针对稳定性指标 (group_cv) 会自动添加数据条 (Data Bars) 可视化。
-        [新增] 针对 PSI 指标，使用红绿灯色系 (Red-Yellow-Green) 警示风险。
+        展示指定指标的分组趋势。
 
         Parameters
         ----------
         metric : str
-            统计指标名称，例如：'mean', 'std', 'max', 'p50' 等。
+            指标名称，例如 ``"missing"``、``"mean"`` 或 ``"psi"``。
+        features : Union[str, List[str]] | None
+            需要展示的特征名称。若为 ``None``，展示全部特征。
+        group_ascending : bool
+            分组列或时间切片列的横向排序方向。
+        sort_by : Union[List[str], str]
+            趋势表内部排序依据，可以是单列或多列列表。
+        sort_ascending : bool
+            是否按 ``sort_by`` 升序排列。
 
         Returns
         -------
         pd.io.formats.style.Styler
-            包含稳定性数据条展示的 Pandas Styler 对象。
+            样式化趋势热力表。
 
         Raises
         ------
         ValueError
-            当输入的指标名称不在 stats_tables 中时抛出。
+            当 ``metric`` 不在当前报告支持的指标范围内时抛出。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> overview = pl.DataFrame({"feature": ["age"], "dtype": ["Int64"], "missing_rate": [0.0]})
+        >>> trend = pl.DataFrame({"feature": ["age"], "dtype": ["Int64"], "2026-01": [0.0], "total": [0.0]})
+        >>> report = MarsProfileReport(overview, dq_tables={"missing": trend}, stats_tables={})
+        >>> hasattr(report.show_trend("missing", features="age"), "to_html")
+        True
         """
-        if metric not in self.stats_tables:
-            raise ValueError(f"Unknown stats metric: {metric}")
-        
-        # [修改] 针对 PSI 的特殊可视化逻辑
-        cmap = "Blues"
-        vmin, vmax = None, None
-        
+        # 路由逻辑：查找指标属于哪个表
+        source_type = self._metric_index.get(metric)
+        if source_type is None:
+            # 提供可用指标的快速提示，方便交互式探索。
+            available = list(self._metric_index.keys())
+            raise ValueError(f"Metric '{metric}' not found. Available metrics: {available[:10]}...")
+
+        # 获取数据
+        if source_type == "dq":
+            df_raw = self.dq_tables[metric]
+            # DQ 默认配置
+            cmap = "RdYlGn_r"  # 红色代表高风险 (高缺失)
+            fmt_pct = True     # DQ 指标通常是率 (Rate/Ratio)
+            vmin, vmax = 0, 1  # 率通常在 0~1 之间
+
+        else: # source_type 为 "stat"。
+            df_raw = self.stats_tables[metric]
+            # 统计指标默认配置
+            cmap = "Blues"     # 蓝色代表数值高低 (中性)
+            fmt_pct = False    # 统计值通常是绝对值
+            vmin, vmax = None, None
+
+        # 特殊指标覆盖配置
         if metric == "psi":
-            # 使用红黄绿反转色系: 低(绿) -> 中(黄) -> 高(红)
-            cmap = "RdYlGn_r"
-            # [关键] 锚定 PSI 的绝对值范围，确保 0.25 以上呈现明显的红色
-            # 0.0 (Green) --- 0.1 (Yellow) --- 0.25 (Red) --- 0.5 (Dark Red)
-            vmin = 0.0
-            vmax = 0.5 
-        
+            cmap = "RdYlGn_r" # PSI 高了是坏事
+            fmt_pct = False   # PSI 是数值不是百分比
+            vmin, vmax = 0.0, 0.5 # 锚定阈值
+
+        df = _as_pandas_frame(df_raw).copy()
+
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
+
+        # 排序
+        df = df.sort_values(by=sort_by, ascending=sort_ascending)
+        df = self._reorder_trend_cols(df, group_ascending=group_ascending)
+
         return self._get_styler(
-            self.stats_tables[metric], 
-            title=f"Stats Trend: {metric}", 
-            cmap=cmap, 
-            add_bars=True,
-            fmt_as_pct=False,
-            # [新增] 传入范围参数
+            df,
+            title=f"Trend Analysis: {metric}",
+            cmap=cmap,
+            fmt_as_pct=fmt_pct,
             vmin=vmin,
-            vmax=vmax
+            vmax=vmax,
+            add_bars=True # 所有趋势表都允许显示 CV 条
         )
 
-    def write_excel(self, path: str = "mars_report.xlsx") -> None:
-        """
-        将分析结果完整导出为带视觉格式的 Excel 文件。
-        
-        导出内容包括：
-        1. Overview (概览页): 包含特征分布热力图。
-        2. DQ_{Metric} (质量趋势页): 包含缺失率等趋势。
-        3. Trend_{Metric} (分布趋势页): 包含稳定性分析及数据条展示。
+    def _reorder_trend_cols(self, df: pd.DataFrame, group_ascending: bool) -> pd.DataFrame:
+        """重新排列趋势表的列顺序。"""
+        # 定义元数据列和末尾统计列
+        meta_cols = ["feature", "dtype", "distribution", "top1_value"]
+        stat_cols = ["total", "group_mean", "group_var", "group_cv"]
 
-        Excel 特性：
-        - 百分比数字格式。
-        - 自动列宽适配。
-        - 冻结表头样式。
+        # 识别中间的分组列（如时间列）
+        all_cols = df.columns.tolist()
+        group_cols = [c for c in all_cols if c not in meta_cols + stat_cols]
+
+        # 排序分组列 (受 group_ascending 控制)
+        group_cols_sorted = sorted(group_cols, reverse=not group_ascending)
+
+        # 组合最终顺序
+        final_order = (
+            [c for c in meta_cols if c in all_cols]
+            + group_cols_sorted
+            + [c for c in stat_cols if c in all_cols]
+        )
+        return df[final_order]
+
+    def write_excel(self,
+                    path: str = "mars_report.xlsx",
+                    group_ascending: bool = True,
+                    sort_by: Union[str, List[str]] = "total",
+                    sort_ascending: bool = False) -> None:
+        """
+        导出画像 Excel 报告。
 
         Parameters
         ----------
-        path : str, default "mars_report.xlsx"
-            导出文件的目标路径。
+        path : str
+            输出文件路径。
+        group_ascending : bool
+            趋势页中分组列的横向排序方向。
+        sort_by : Union[str, List[str]]
+            趋势页内部的排序依据。
+        sort_ascending : bool
+            趋势页内部是否按 ``sort_by`` 升序排列。
+
+        Notes
+        -----
+        该方法依赖 ``xlsxwriter`` 导出带样式的多工作表 Excel 文件。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> from pathlib import Path
+        >>> from tempfile import TemporaryDirectory
+        >>> overview = pl.DataFrame(
+        ...     {
+        ...         "feature": ["age"],
+        ...         "dtype": ["Int64"],
+        ...         "missing_rate": [0.0],
+        ...         "zeros_rate": [0.0],
+        ...         "unique_rate": [1.0],
+        ...         "top1_ratio": [0.25],
+        ...     }
+        ... )
+        >>> report = MarsProfileReport(overview, dq_tables={}, stats_tables={})
+        >>> with TemporaryDirectory() as tmp:
+        ...     report.write_excel(str(Path(tmp) / "profile.xlsx")) is None
+        True
         """
-        logger.info(f"📊 Exporting report to: {path}...")
+        logger.info(f"Exporting report to: {path}...")
+
+        # 1. 依赖检查
+        if importlib.util.find_spec("xlsxwriter") is None:
+            logger.error(
+                "'xlsxwriter' is included in the base mars-risk installation; "
+                "reinstall mars-risk if missing."
+            )
+            return
+
         try:
             with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
-                # 1. 导出概览页
-                overview_styler: Optional["pd.io.formats.style.Styler"] = self.show_overview()
+                #--------------------------------------------------------
+                # 1. 导出概览页 (Overview)
+                #--------------------------------------------------------
+                overview_styler = self.show_overview()
                 if overview_styler is not None:
                     overview_styler.to_excel(writer, sheet_name="Overview", index=False)
-                
-                # 2. 导出 DQ 指标页
-                for name in self.dq_tables:
-                    dq_styler = self.show_dq(name)
-                    if dq_styler is not None:
-                        dq_styler.to_excel(writer, sheet_name=f"DQ_{name}", index=False)
-                
-                # 3. 导出统计指标页 (特别处理 Data Bars 和 PSI Colors)
-                for name in self.stats_tables:
-                    trend_styler = self.show_trend(name)
-                    if trend_styler is not None:
-                        sheet_name: str = f"Trend_{name.capitalize()}"
-                        trend_styler.to_excel(writer, sheet_name=sheet_name, index=False)
-                        
-                        df_pd: pd.DataFrame = self._to_pd(self.stats_tables[name])
-                        worksheet = writer.sheets[sheet_name]
-                        
-                        # [新增] 针对 PSI 的 Excel 条件格式 (3色阶)
-                        # 规则: 0(绿) -> 0.1(黄) -> 0.25(红)
-                        if name == "psi":
-                            # 确定应用范围: 除去 feature, dtype, total, group_var, group_cv 之外的数据列
-                            # 或者简单点，对所有数值格应用 (Excel 会自动忽略文本)
-                            start_col_idx = 0
-                            end_col_idx = len(df_pd.columns) - 1
-                            
-                            worksheet.conditional_format(1, start_col_idx, len(df_pd), end_col_idx, {
-                                'type': '3_color_scale',
-                                'min_type': 'num', 'min_value': 0,    'min_color': '#63BE7B', # Green
-                                'mid_type': 'num', 'mid_value': 0.1,  'mid_color': '#FFEB84', # Yellow
-                                'max_type': 'num', 'max_value': 0.25, 'max_color': '#F8696B'  # Red
-                            })
 
-                        # 通过 xlsxwriter 原生接口补全 Data Bars 导出支持 (针对 group_cv)
-                        if "group_cv" in df_pd.columns:
-                            col_idx: int = df_pd.columns.get_loc("group_cv")
-                            # 应用红色渐变数据条
-                            worksheet.conditional_format(1, col_idx, len(df_pd), col_idx, {
-                                'type': 'data_bar', 
-                                'bar_color': '#FF9999', 
-                                'bar_solid': True,
-                                'min_type': 'num', 'min_value': 0, 
-                                'max_type': 'num', 'max_value': 1
-                            })
-                            
-                # 4. 自动列宽调整
+                #--------------------------------------------------------
+                # 2. 统一导出所有趋势页 (Trend & DQ)
+                #--------------------------------------------------------
+                dq_keys = list(self.dq_tables.keys())
+                stat_keys = list(self.stats_tables.keys())
+                all_metrics = dq_keys + stat_keys
+
+                for metric in all_metrics:
+                    # 保证导出的表结构与 Notebook 展示完全一致
+                    styler = self.show_trend(
+                        metric,
+                        group_ascending=group_ascending,
+                        sort_by=sort_by,
+                        sort_ascending=sort_ascending
+                    )
+
+                    if styler is not None:
+                        prefix = "DQ" if metric in self.dq_tables else "Trend"
+                        sheet_name = f"{prefix}_{metric.capitalize()}"[:31]
+
+                        styler.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                        # 确保条件格式锚定的列与导出的表完全吻合
+                        self._apply_excel_formatting(
+                            writer, sheet_name, metric,
+                            group_ascending=group_ascending,
+                            sort_by=sort_by,
+                            sort_ascending=sort_ascending
+                        )
+
+                # 3. 自动列宽调整
                 for sheet in writer.sheets.values():
                     sheet.autofit()
-                    
-            logger.info("✅ Report exported successfully.")
+
+            logger.info("Report exported successfully.")
+
         except Exception as e:
-            logger.error(f"❌ Failed to export Excel: {e}")
+            logger.error(f"Failed to export Excel: {e}", exc_info=True)
 
-    def _to_pd(self, df: Any) -> pd.DataFrame:
-        """
-        [辅助方法] 确保数据转换为 Pandas DataFrame 格式。
+    def _apply_excel_formatting(
+        self,
+        writer: Any,
+        sheet_name: str,
+        metric: str,
+        group_ascending: bool,
+        sort_by: str | list[str],
+        sort_ascending: bool,
+    ) -> None:
+        """为导出的趋势工作表应用条件格式。"""
+        if metric in self.dq_tables:
+            raw_df = self.dq_tables[metric]
+        else:
+            raw_df = self.stats_tables[metric]
 
-        Parameters
-        ----------
-        df : Any
-            输入数据，支持 Polars DataFrame 或 Pandas DataFrame。
+        # 必须和 show_trend 的内部重排逻辑一模一样，否则 Excel 样式会错位
+        df_pd: pd.DataFrame = _as_pandas_frame(raw_df).copy()
 
-        Returns
-        -------
-        pd.DataFrame
-            转换后的 Pandas 对象。
-        """
-        if isinstance(df, pl.DataFrame):
-            return df.to_pandas()
-        return df
+        # 匹配行排序
+        if sort_by in df_pd.columns or (isinstance(sort_by, list) and all(c in df_pd.columns for c in sort_by)):
+            df_pd = df_pd.sort_values(by=sort_by, ascending=sort_ascending)
+
+        # 匹配列排序
+        df_pd = self._reorder_trend_cols(df_pd, group_ascending=group_ascending)
+
+        # 动态识别趋势列范围，避免依赖固定列位置。
+        meta_and_stat = set(["feature", "dtype", "distribution", "top1_value", "total", "group_mean", "group_var", "group_cv"])
+        time_cols = [c for c in df_pd.columns if c not in meta_and_stat]
+
+        if not time_cols:
+            return
+
+        worksheet = writer.sheets[sheet_name]
+
+        # PSI 专用三色阶 (红绿灯)
+        if metric == "psi":
+            meta_cols = ["feature", "dtype", "distribution", "top1_value"]
+            start_col = 0
+            for i, col in enumerate(df_pd.columns):
+                if col not in meta_cols:
+                    start_col = i
+                    break
+
+            end_col = len(df_pd.columns) - 1
+
+            worksheet.conditional_format(1, start_col, len(df_pd), end_col, {
+                'type': '3_color_scale',
+                'min_type': 'num', 'min_value': 0.05, 'min_color': '#63BE7B', # 绿色
+                'mid_type': 'num', 'mid_value': 0.15, 'mid_color': '#FFEB84', # 黄色
+                'max_type': 'num', 'max_value': 0.25, 'max_color': '#F8696B'  # 红色
+            })
+
+        # 稳定性 Data Bars (针对 group_cv)
+        if "group_cv" in df_pd.columns:
+            col_idx = df_pd.columns.get_loc("group_cv")
+            worksheet.conditional_format(1, col_idx, len(df_pd), col_idx, {
+                'type': 'data_bar',
+                'bar_color': '#638EC6',
+                'bar_solid': True,
+                'min_type': 'num', 'min_value': 0,
+                'max_type': 'num', 'max_value': 1
+            })
 
     def _get_styler(
-        self, 
-        df_input: Any, 
-        title: str, 
-        cmap: str, 
-        subset_cols: Optional[List[str]] = None, 
-        add_bars: bool = False, 
+        self,
+        df_input: Any,
+        title: str,
+        cmap: str,
+        sort_by: List[str] | None = None,
+        sort_ascending: bool = False, # 统一内部 API 命名
+        subset_cols: List[str] | None = None,
+        add_bars: bool = False,
         fmt_as_pct: bool = False,
-        vmin: Optional[float] = None, # [新增] 支持自定义最小值
-        vmax: Optional[float] = None  # [新增] 支持自定义最大值
+        vmin: float | None = None,
+        vmax: float | None = None
     ) -> Optional["pd.io.formats.style.Styler"]:
-        """
-        [Internal] 通用样式生成器。
-        
-        负责构建统一的 Pandas Styler 对象，处理色彩映射、数值格式和 CSS 样式。
-
-        Parameters
-        ----------
-        df_input : Any
-            待格式化的 DataFrame。
-        title : str
-            表格标题 (Caption)。
-        cmap : str
-            色彩映射方案 (Matplotlib colormap)。
-        subset_cols : List[str], optional
-            指定应用渐变色的列。若为 None 则对所有可用数值列应用。
-        add_bars : bool, default False
-            是否在 'group_cv' 列上绘制数据条。
-        fmt_as_pct : bool, default False
-            是否强制将数值列显示为百分比。
-        vmin : float, optional
-            渐变色的下限值。
-        vmax : float, optional
-            渐变色的上限值。
-
-        Returns
-        -------
-        Optional[pd.io.formats.style.Styler]
-            配置完成的 Styler 对象；若输入为空则返回 None。
-        """
+        """生成统一的 Pandas Styler 样式对象。"""
         if df_input is None:
             return None
-        df: pd.DataFrame = self._to_pd(df_input)
+        df: pd.DataFrame = _as_pandas_frame(df_input)
+        if sort_by is not None:
+            df = df.sort_values(by=sort_by, ascending=sort_ascending) # 使用统一参数进行底层排序
         if df.empty:
             return None
 
-        # 元数据排除列表：不参与热力图染色和百分比格式化
+        # 元数据排除列表
         exclude_meta: List[str] = [
-            "feature", "dtype", 
+            "feature", "dtype",
             "group_mean", "group_var", "group_cv",
             "distribution",
             "top1_value"
             ]
-        
-        # 1. 确定色彩渐变范围
+
+        # 确定色彩渐变范围
         if subset_cols:
             gradient_cols: List[str] = [c for c in subset_cols if c in df.columns]
         else:
             gradient_cols = [c for c in df.columns if c not in exclude_meta]
 
         styler = df.style.set_caption(f"<b>{title}</b>").hide(axis="index")
-        
-        # 2. 应用热力图 (支持 vmin/vmax)
+
+        # 应用热力图
         if gradient_cols:
-            # [修改] 传递 vmin/vmax 到 background_gradient
             styler = styler.background_gradient(
-                cmap=cmap, 
-                subset=gradient_cols, 
+                cmap=cmap,
+                subset=gradient_cols,
                 axis=None,
                 vmin=vmin,
                 vmax=vmax
             )
-        
-        # 3. 应用数据条 (稳定性专用)
+
+        # 应用数据条
         if add_bars and "group_cv" in df.columns:
             styler = styler.bar(subset=["group_cv"], color='#ff9999', vmin=0, vmax=1, width=90)
             styler = styler.format("{:.4f}", subset=["group_cv", "group_var"])
 
-        # 4. 数值格式化逻辑
+        # 数值格式化逻辑
         num_cols: pd.Index = df.select_dtypes(include=['number']).columns
         data_cols: List[str] = [c for c in num_cols if c not in ["group_var", "group_cv", "distribution"]]
 
-        pct_format: str = "{:.2%}"  
+        pct_format: str = "{:.2%}"
         float_format: str = "{:.2f}"
 
         if fmt_as_pct:
-            # 强制百分比模式 (DQ 模式)
             if data_cols:
                 styler = styler.format(pct_format, subset=data_cols)
         else:
             pct_cols: List[str] = [
-                c for c in df.columns 
+                c for c in df.columns
                 if ("rate" in c or "ratio" in c) and (c in num_cols)
             ]
-            
+
             if pct_cols:
                 styler = styler.format(pct_format, subset=pct_cols)
-            
-            # 对剩余的数值列应用浮点格式
+
             float_cols: List[str] = [c for c in data_cols if c not in pct_cols]
             if float_cols:
                 styler = styler.format(float_format, subset=float_cols)
-        
-        # 5. 分布迷你图 (Sparkline) 样式配置
+
+        # 分布迷你图样式
         if "distribution" in df.columns:
-            # 注入 CSS 确保等宽字体和颜色一致性
             styler = styler.set_table_styles([
                 {'selector': '.col_distribution', 'props': [
-                    ('font-family', 'monospace'), 
+                    # 优先使用 Consolas (Win) 或 Menlo (Mac)，最后 fallback 到 monospace
+                    ('font-family', '"Consolas", "Menlo", "Courier New", monospace'),
                     ('color', '#1f77b4'),
+                    ('white-space', 'pre'), # [关键] 防止 HTML 自动压缩连续空格
                     ('font-weight', 'bold'),
                     ('text-align', 'left')
                 ]}
             ], overwrite=False)
 
-        # 6. 全局表格外观配置
+        # 全局表格外观
         styler = styler.set_table_styles([
             {
-                'selector': 'th', 
+                'selector': 'th',
                 'props': [('text-align', 'left'), ('background-color', '#f0f2f5'), ('color', '#333')]
             },
             {
-                'selector': 'caption', 
+                'selector': 'caption',
                 'props': [('font-size', '1.2em'), ('padding', '10px 0'), ('color', '#2c3e50')]
             }
         ], overwrite=False)
 
         return styler
+
+class MarsEvaluationReport:
+    """
+    特征效能与稳定性评估报告容器。
+
+    作为风控特征工程流水线的标准输出载体，该组件负责统一管理并呈现由 `MarsBinEvaluator`
+    产出的高维特征评估度量与多维趋势矩阵。系统封装了对底层评估数据帧的只读访问接口、
+    面向交互式分析环境的富文本视图渲染，以及跨平台的高保真电子表格持久化导出能力，
+    以支撑特征区分度审计与跨期分布漂移监控。
+
+    Attributes
+    ----------
+    summary_table : DataFrame
+        内部持有的特征级汇总评估宽表引用。
+
+    trend_tables : dict of str to DataFrame
+        内部持有的核心评估指标趋势字典引用。
+
+    detail_table : DataFrame
+        内部持有的细粒度分箱明细表引用。
+
+    group_col : str
+        内部挂载的分组维度标识。
+
+    Notes
+    -----
+    该容器提供了针对特征评估诊断的统一交互层 API。其暴露的 `show_summary` 与 `show_trend`
+    方法通过动态构建样式渲染器（Pandas Styler），支持直接将风控指标梯度映射为预警色带
+    与数据条，以加速区分度缺陷与单调性倒挂的物理识别。
+    执行持久化导出时，底层引擎严格还原交互式视图中的条件格式与业务阈值规则，确保离线
+    模型监控文档与线上审计视图的视觉连贯性。
+
+    Examples
+    --------
+    >>> import polars as pl
+    >>> summary = pl.DataFrame({"feature": ["age"], "iv": [0.12], "ks": [18.0]})
+    >>> detail = pl.DataFrame({"feature": ["age"], "bin_index": [0], "count": [100]})
+    >>> trend_tables = {"psi": pl.DataFrame({"feature": ["age"], "202601": [0.01]})}
+    >>> report = MarsEvaluationReport(summary, trend_tables, detail, group_col="month")
+    >>> report.get_evaluation_data()[0].height
+    1
+    """
+
+    def __init__(
+        self,
+        summary_table: Union[pl.DataFrame, pd.DataFrame],
+        trend_tables: Dict[str, Union[pl.DataFrame, pd.DataFrame]],
+        detail_table: Union[pl.DataFrame, pd.DataFrame],
+        group_col: str | None = None,
+        feature_data_source: Dict[str, str] | None = None,
+        dt_col: str | None = None,
+        missing_by_day_table: Union[pl.DataFrame, pd.DataFrame] | None = None,
+        report_meta: Dict[str, Any] | None = None,
+    ) -> None:
+        """
+        初始化报告容器。
+
+        Parameters
+        ----------
+        summary_table : Union[pl.DataFrame, pd.DataFrame]
+            特征级汇总表。
+        trend_tables : Dict[str, Union[pl.DataFrame, pd.DataFrame]]
+            指标趋势表字典。
+        detail_table : Union[pl.DataFrame, pd.DataFrame]
+            最细粒度的分箱明细表。
+        group_col : str | None
+            分组列名（例如：'month' 或 'vintage'）。
+        feature_data_source : Dict[str, str] | None
+            特征到数据源标签的映射。
+        dt_col : str | None
+            原始日期列名。
+        missing_by_day_table : Union[pl.DataFrame, pd.DataFrame] | None
+            按日汇总的缺失率明细表。
+        report_meta : Dict[str, Any] | None
+            报告元信息，例如目标列、绘图配置或上下文标签。
+        """
+        # 直接存储原始数据，不再强制命名为 _pl，以支持多种类型
+        self._summary = summary_table
+        self._trend_dict = trend_tables
+        self._detail = detail_table
+        self.group_col = group_col
+        self.feature_data_source = feature_data_source or {}
+        self.dt_col = dt_col
+        self._missing_by_day = missing_by_day_table
+        self._report_meta = report_meta or {}
+
+    @property
+    def summary_table(self) -> Union[pl.DataFrame, pd.DataFrame]:
+        """
+        返回特征汇总评估表。
+
+        Returns
+        -------
+        pl.DataFrame or pd.DataFrame
+            与构造时输入类型一致的汇总表。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> summary = pl.DataFrame({"feature": ["age"], "iv": [0.12]})
+        >>> report = MarsEvaluationReport(summary, {}, pl.DataFrame())
+        >>> report.summary_table.height
+        1
+        """
+        return self._summary
+
+    @property
+    def trend_tables(self) -> Dict[str, Union[pl.DataFrame, pd.DataFrame]]:
+        """
+        返回指标趋势表字典。
+
+        Returns
+        -------
+        dict of str to pl.DataFrame or pd.DataFrame
+            键为指标名称，值为对应趋势宽表。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> trend = {"psi": pl.DataFrame({"feature": ["age"], "2026-01": [0.01]})}
+        >>> report = MarsEvaluationReport(pl.DataFrame(), trend, pl.DataFrame())
+        >>> sorted(report.trend_tables)
+        ['psi']
+        """
+        return self._trend_dict
+
+    @property
+    def detail_table(self) -> Union[pl.DataFrame, pd.DataFrame]:
+        """
+        返回分箱明细表。
+
+        Returns
+        -------
+        pl.DataFrame or pd.DataFrame
+            与构造时输入类型一致的分箱明细表。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> detail = pl.DataFrame({"feature": ["age"], "bin_index": [0]})
+        >>> report = MarsEvaluationReport(pl.DataFrame(), {}, detail)
+        >>> report.detail_table.height
+        1
+        """
+        return self._detail
+
+    @property
+    def missing_by_day_table(self) -> Union[pl.DataFrame, pd.DataFrame] | None:
+        """
+        返回按日聚合的缺失明细表。
+
+        Returns
+        -------
+        pl.DataFrame or pd.DataFrame or None
+            若评估流程生成了按日缺失统计，则返回对应表；否则返回 ``None``。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> missing = pl.DataFrame({"feature": ["age"], "date": ["2026-01-01"], "missing_rate": [0.0]})
+        >>> report = MarsEvaluationReport(pl.DataFrame(), {}, pl.DataFrame(), missing_by_day_table=missing)
+        >>> report.missing_by_day_table.height
+        1
+        """
+        return self._missing_by_day
+
+    @property
+    def report_meta(self) -> Dict[str, Any]:
+        """
+        返回报告元信息字典。
+
+        Returns
+        -------
+        dict of str to Any
+            生成报告时记录的辅助元数据。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> report = MarsEvaluationReport(pl.DataFrame(), {}, pl.DataFrame(), report_meta={"target": "y"})
+        >>> report.report_meta["target"]
+        'y'
+        """
+        return self._report_meta
+
+    def get_evaluation_data(self) -> Tuple[
+        Union[pl.DataFrame, pd.DataFrame],
+        Dict[str, Union[pl.DataFrame, pd.DataFrame]],
+        Union[pl.DataFrame, pd.DataFrame]
+    ]:
+        """
+        获取评估报告的原始数据。
+
+        Returns
+        -------
+        tuple
+            依次返回 ``(summary_table, trend_tables, detail_table)``，
+            且各对象类型与构造时输入保持一致。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> summary = pl.DataFrame({"feature": ["age"], "iv": [0.12]})
+        >>> detail = pl.DataFrame({"feature": ["age"], "bin_index": [0]})
+        >>> report = MarsEvaluationReport(summary, {}, detail)
+        >>> report.get_evaluation_data()[0].height
+        1
+        """
+        return self.summary_table, self.trend_tables, self.detail_table
+
+    def _repr_html_(self) -> str:
+        """返回 Jupyter 环境下的评估摘要面板。"""
+        # 内部展示逻辑统一转为 Pandas 处理
+        df_summary_pd = _as_pandas_frame(self.summary_table)
+        n_feats = len(df_summary_pd)
+
+        # 简单统计报警数 (修正为新的小写列名 psi_max)
+        high_risk_psi = 0
+        if "psi_max" in df_summary_pd.columns:
+            high_risk_psi = sum(df_summary_pd["psi_max"] > 0.25)
+
+        # 样式定义
+        pill_style = (
+            "background-color: #e8f4f8; color: #2980b9; border: 1px solid #bce0eb; "
+            "padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; margin-right: 4px;"
+        )
+
+        # 动态生成 Trend 链接
+        trend_keys = list(self.trend_tables.keys())
+        trend_pills = "".join([f"<span style='{pill_style}'>'{k}'</span>" for k in trend_keys])
+
+        lines = []
+        # 查看类操作
+        lines.append('👉 <code>.show_summary()</code> &nbsp;<span style="color:#7f8c8d">View Feature Ranking</span>')
+        lines.append(f'👉 <code>.show_trend(metric)</code> <span style="color:#7f8c8d">metric: {trend_pills}</span>')
+
+        # 数据访问与导出入口
+        lines.append('<hr style="margin: 8px 0; border: 0; border-top: 1px dashed #ccc;">')
+        lines.append('📥 <code>.get_evaluation_data()</code> &nbsp;<span style="color:#7f8c8d">Get Raw Data (summary, trends, detail)</span>')
+        lines.append('💾 <code>.write_excel()</code> &nbsp;<span style="color:#7f8c8d">Export to Excel</span>')
+
+        return f"""
+        <div style="border-left: 5px solid #8e44ad; background-color: #f4f6f7; padding: 15px; border-radius: 0 5px 5px 0; font-family: 'Segoe UI', sans-serif;">
+            <h3 style="margin:0 0 10px 0; color:#2c3e50;">📉 Mars Feature Evaluation</h3>
+
+            <div style="display: flex; gap: 30px; margin-bottom: 12px; font-size: 0.95em;">
+                <div><strong>🏷️ Features:</strong> {n_feats}</div>
+                <div><strong>🚨 High PSI (>0.25):</strong> <span style="color: {'red' if high_risk_psi > 0 else 'green'}; font-weight:bold;">{high_risk_psi}</span></div>
+                <div><strong>📅 Group By:</strong> {self.group_col if self.group_col else 'None (Total Only)'}</div>
+            </div>
+
+            <div style="font-size:0.9em; line-height:1.8; color:#2c3e50; background: white; padding: 10px; border: 1px solid #e0e0e0; border-radius: 4px;">
+                { "<br>".join(lines) }
+            </div>
+        </div>
+        """
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        """将任意标题转换为可作为 HTML id 的稳定片段。"""
+        slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(value))
+        slug = "-".join(part for part in slug.split("-") if part)
+        return slug or "section"
+
+    @staticmethod
+    def _wrap_html_section(title: str, body: str, section_id: str, subtitle: str | None = None, open_by_default: bool = True) -> str:
+        """将一段 HTML 内容包装成可折叠的报告 section。"""
+        open_attr = " open" if open_by_default else ""
+        subtitle_html = f'<div class="mars-section-subtitle">{html.escape(subtitle)}</div>' if subtitle else ""
+        return f"""
+        <details id="{section_id}" class="mars-section"{open_attr}>
+            <summary>{html.escape(title)}</summary>
+            {subtitle_html}
+            <div class="mars-section-body">
+                {body}
+            </div>
+        </details>
+        """
+
+    @staticmethod
+    def _is_missing_html_value(value: Any) -> bool:
+        """判断单元格值在 HTML 表格中是否应按空值展示。"""
+        return is_missing_html_value(value)
+
+    @classmethod
+    def _format_html_value(
+        cls: type["MarsEvaluationReport"],
+        value: Any,
+        *,
+        as_percent: bool = False,
+        precision: int = 2,
+    ) -> str:
+        """按数值、百分比和缺失值语义格式化 HTML 单元格文本。"""
+        return format_html_value(
+            value,
+            as_percent=as_percent,
+            precision=precision,
+            missing_text="",
+        )
+
+    @staticmethod
+    def _normalize_search_text(*parts: Any) -> str:
+        """将多个文本片段合并为前端搜索使用的标准小写串。"""
+        joined = " ".join("" if part is None else str(part) for part in parts)
+        return " ".join(joined.split()).strip().lower()
+
+    @classmethod
+    def _is_percent_column(
+        cls: type["MarsEvaluationReport"],
+        col_name: Any,
+        *,
+        metric_name: str | None = None,
+    ) -> bool:
+        """
+        判断列在 HTML 表格中是否应按百分比格式展示。
+
+        该判断结合列名和指标名处理 ``missing``、``bad_rate``、``pct`` 等
+        风控报告常见字段，避免普通标识列被误格式化。
+        """
+        col_lower = str(col_name).strip().lower()
+        metric_lower = str(metric_name or "").strip().lower()
+
+        non_percent_labels = {"feature", "dtype", "data_source", "target", "y", "bin"}
+        if col_lower in non_percent_labels:
+            return False
+
+        if metric_lower in {"missing", "bad_rate"} and col_lower not in non_percent_labels:
+            return True
+
+        if col_lower in {"pct", "risk", "missing", "missing_rate", "bad_rate", "cum_bad_rate"}:
+            return True
+
+        if col_lower.startswith("missing"):
+            return True
+
+        return (
+            col_lower.endswith(("_rate", "_ratio", "_pct"))
+            or col_lower.startswith(("pct_", "risk_"))
+            or col_lower.endswith("%")
+        )
+
+    @staticmethod
+    def _interpolate_rgb(start: Tuple[int, int, int], end: Tuple[int, int, int], ratio: float) -> Tuple[int, int, int]:
+        """在两个 RGB 颜色之间按比例插值。"""
+        return tuple(
+            int(round(start[idx] + (end[idx] - start[idx]) * ratio))
+            for idx in range(3)
+        )
+
+    @classmethod
+    def _three_color_rgb(
+        cls: type["MarsEvaluationReport"],
+        ratio: float,
+        *,
+        reverse: bool = False,
+    ) -> Tuple[int, int, int]:
+        """生成红黄绿三段式色阶中的 RGB 颜色。"""
+        ratio = max(0.0, min(1.0, ratio))
+        low = (248, 105, 107) if not reverse else (99, 190, 123)
+        mid = (255, 235, 132)
+        high = (99, 190, 123) if not reverse else (248, 105, 107)
+        if ratio <= 0.5:
+            return cls._interpolate_rgb(low, mid, ratio * 2.0)
+        return cls._interpolate_rgb(mid, high, (ratio - 0.5) * 2.0)
+
+    @classmethod
+    def _column_colspan(cls: type["MarsEvaluationReport"], col_name: Any) -> int:
+        """根据扁平化列名中的分隔符估算表头 colspan。"""
+        return max(1, str(col_name).count("|") + 1)
+
+    @classmethod
+    def _format_sort_value(cls: type["MarsEvaluationReport"], value: Any, sort_type: str) -> str:
+        """为前端排序属性生成稳定的字符串化值。"""
+        if cls._is_missing_html_value(value):
+            return ""
+
+        if sort_type == "number":
+            try:
+                return f"{float(value):.12g}"
+            except (TypeError, ValueError):
+                return ""
+
+        return str(value)
+
+    @staticmethod
+    def _reorder_group_columns(df: pd.DataFrame, leading_cols: List[str]) -> pd.DataFrame:
+        """
+        按报告展示习惯重排分组列。
+
+        指定的前置列会保持在最左侧，``Total`` 固定放在最右侧，其余分组列
+        使用稳定排序，保证 Notebook、Excel 与 HTML 报告列序一致。
+        """
+        if df.empty:
+            return df
+
+        head_cols = [c for c in leading_cols if c in df.columns]
+        other_cols = [c for c in df.columns if c not in head_cols]
+        non_total = sorted([c for c in other_cols if c != "Total"])
+        tail_cols = ["Total"] if "Total" in other_cols else []
+        return df[head_cols + non_total + tail_cols]
+
+    @staticmethod
+    def _resolve_chart_sort_column(summary_df: pd.DataFrame, requested: str) -> str | None:
+        """解析图表排序列，缺失请求列时回退到风险摘要或首个数值列。"""
+        if requested in summary_df.columns:
+            return requested
+        if "psi_max" in summary_df.columns:
+            return "psi_max"
+
+        numeric_cols = [
+            c for c in summary_df.select_dtypes(include=[np.number]).columns
+            if c not in {"bin_index"}
+        ]
+        return numeric_cols[0] if numeric_cols else None
+
+    @staticmethod
+    def _semantic_for_metric(metric: str) -> str:
+        """返回指标在热力图中的业务方向语义。"""
+        metric = str(metric).lower()
+        if metric.startswith("missing") or metric in {"psi", "psi_max", "missing_rate"}:
+            return "risk_high"
+        if metric.startswith("lift") or metric in {"iv", "auc", "ks", "risk_corr", "rc_min"}:
+            return "good_high"
+        if metric == "mono":
+            return "diverging"
+        return "neutral"
+
+    @staticmethod
+    def _escape_attr(value: Any) -> str:
+        """按 HTML 属性上下文转义任意值。"""
+        return html.escape("" if value is None else str(value), quote=True)
+
+    @staticmethod
+    def _trend_style_rule(metric: str | None) -> Dict[str, Any] | None:
+        """
+        返回趋势指标对应的阈值色阶规则。
+
+        不同指标的好坏方向不同，规则中会显式编码锚点、颜色和部分高亮阈值，
+        供 HTML 表格和图例复用。
+        """
+        metric_key = str(metric or "").lower()
+        purple_rgb = (160, 98, 196)
+        green = (99, 190, 123)
+        yellow = (255, 235, 132)
+        red = (248, 105, 107)
+
+        rules: Dict[str, Dict[str, Any]] = {
+            "missing": {"anchors": (0.0, 0.5, 1.0), "colors": (green, yellow, red)},
+            "psi": {"anchors": (0.0, 0.1, 0.25), "colors": (green, yellow, red)},
+            "iv": {"anchors": (0.01, 0.05, 0.1), "colors": (red, yellow, green), "purple_above": 0.2, "purple_rgb": purple_rgb},
+            "ks": {"anchors": (4.0, 8.0, 12.0), "colors": (red, yellow, green), "purple_above": 16.0, "purple_rgb": purple_rgb},
+            "auc": {"anchors": (0.525, 0.55, 0.575), "colors": (red, yellow, green), "purple_above": 0.625, "purple_rgb": purple_rgb},
+            "lift": {"anchors": (1.2, 1.3, 1.4), "colors": (red, yellow, green), "purple_above": 1.5, "purple_rgb": purple_rgb},
+            "risk_corr": {"anchors": (0.2, 0.5, 0.8), "colors": (red, yellow, green)},
+        }
+        return rules.get(metric_key)
+
+    @classmethod
+    def _summary_style_rule(
+        cls: type["MarsEvaluationReport"],
+        metric: str | None,
+    ) -> Dict[str, Any] | None:
+        """解析汇总表指标对应的阈值色阶规则。"""
+        metric_key = str(metric or "").lower()
+        if metric_key in {"iv", "ks", "auc", "psi_max", "rc_min", "lift_max", "missing", "missing_min", "missing_max"}:
+            mapped = {
+                "psi_max": "psi",
+                "rc_min": "risk_corr",
+                "lift_max": "lift",
+                "missing_min": "missing",
+                "missing_max": "missing",
+            }.get(metric_key, metric_key)
+            return cls._trend_style_rule(mapped)
+        if metric_key == "lift_min":
+            return {
+                "anchors": (0.5, 0.6, 0.7, 0.8),
+                "colors": ((160, 98, 196), (99, 190, 123), (255, 235, 132), (248, 105, 107)),
+            }
+        return None
+
+    @staticmethod
+    def _sort_metric_display_df(df: pd.DataFrame) -> pd.DataFrame:
+        """按 Total 或 feature 列稳定排序趋势指标展示表。"""
+        if df.empty:
+            return df
+        if "Total" in df.columns:
+            sort_vals = pd.to_numeric(df["Total"], errors="coerce")
+            return (
+                df.assign(__mars_total_sort=sort_vals)
+                .sort_values(["__mars_total_sort", "feature"], ascending=[False, True], na_position="last")
+                .drop(columns="__mars_total_sort")
+            )
+        if "feature" in df.columns:
+            return df.sort_values("feature", ascending=True)
+        return df
+
+    @classmethod
+    def _build_threshold_legend_html(
+        cls: type["MarsEvaluationReport"],
+        items: List[Tuple[str, str]],
+        *,
+        legend_id: str,
+    ) -> str:
+        """构建阈值图例的 HTML chip 列表。"""
+        if not items:
+            return ""
+        chips = "".join(
+            f'<span class="mars-legend-chip"><strong>{html.escape(label)}</strong> {html.escape(desc)}</span>'
+            for label, desc in items
+        )
+        return f'<div id="{legend_id}" class="mars-legend">{chips}</div>'
+
+    @classmethod
+    def _build_dataset_overview_html(
+        cls: type["MarsEvaluationReport"],
+        report_meta: Dict[str, Any],
+    ) -> str:
+        """
+        构建报告首页的数据集概览卡片。
+
+        输入来自 ``report_meta``，输出为自包含 HTML 字符串；缺少元信息时返回
+        空字符串，让调用方自然跳过该 section。
+        """
+        if not report_meta:
+            return ""
+
+        def fmt_value(value: Any) -> str:
+            """将缺失元信息统一渲染为首页卡片可展示文本。"""
+            if value is None or value == "":
+                return "N/A"
+            return html.escape(str(value))
+
+        cards = [
+            ("Rows", fmt_value(report_meta.get("row_count"))),
+            ("Features", fmt_value(report_meta.get("feature_count"))),
+            ("Profile By", fmt_value(report_meta.get("profile_by_input"))),
+            ("Groups", fmt_value(report_meta.get("group_count"))),
+        ]
+        if report_meta.get("dt_col"):
+            cards.append(
+                (
+                    "Time Range",
+                    fmt_value(report_meta.get("start_dt")) + " ~ " + fmt_value(report_meta.get("end_dt")),
+                )
+            )
+        targets = report_meta.get("targets") or []
+        cards.append(("Targets", fmt_value(", ".join(str(v) for v in targets) if targets else None)))
+
+        event_rate_map = report_meta.get("event_rate_by_target") or {}
+        if event_rate_map:
+            rate_text = " | ".join(
+                f"{target}: {cls._format_html_value(value, as_percent=True)}" if value is not None else f"{target}: N/A"
+                for target, value in event_rate_map.items()
+            )
+        else:
+            rate_text = "N/A"
+        cards.append(("Event Rate", html.escape(rate_text)))
+        if report_meta.get("feature_start_aware_baseline"):
+            active_features = report_meta.get("feature_start_baseline_features") or []
+            cards.append(
+                (
+                    "Start-Aware Baseline",
+                    fmt_value(f"Enabled ({len(active_features)} features)"),
+                )
+            )
+
+        card_html = "".join(
+            f'<div class="mars-kpi-card"><div class="mars-kpi-label">{label}</div><div class="mars-kpi-value">{value}</div></div>'
+            for label, value in cards
+        )
+        return f'<section id="dataset-overview" class="mars-overview-grid">{card_html}</section>'
+
+    @classmethod
+    def _build_feature_jump_html(
+        cls: type["MarsEvaluationReport"],
+        features: List[str],
+    ) -> str:
+        """构建 Summary 表格的特征跳转控件。"""
+        feature_values = sorted({str(feature) for feature in features if str(feature).strip()})
+        if not feature_values:
+            return ""
+        option_html = "".join(
+            f'<option value="{html.escape(feature)}"></option>'
+            for feature in feature_values
+        )
+        return (
+            '<div class="mars-feature-jump">'
+            '<label class="mars-summary-filter-label" for="mars-feature-jump-input">Jump to Feature</label>'
+            '<div class="mars-search-cluster">'
+            '<input id="mars-feature-jump-input" class="mars-filter-input" type="search" '
+            'list="mars-feature-jump-list" placeholder="Jump to Summary feature..." '
+            'onkeydown="if(event.key===\'Enter\'){event.preventDefault();marsJumpToFeature();}" />'
+            '<datalist id="mars-feature-jump-list">'
+            f'{option_html}'
+            '</datalist>'
+            '<button type="button" class="mars-mini-button" onclick="marsJumpToFeature()">Go</button>'
+            '</div>'
+            '<div class="mars-footnote">Jumps to the matching row in Summary.</div>'
+            '<div id="mars-feature-jump-error" class="mars-search-error"></div>'
+            '</div>'
+        )
+
+    @staticmethod
+    def _table_sticky_role(column_name: Any) -> str | None:
+        """识别表格列是否需要固定在横向滚动区域左侧。"""
+        column_lower = str(column_name).strip().lower()
+        if column_lower == "feature":
+            return "feature"
+        if column_lower == "dtype":
+            return "secondary"
+        return None
+
+    @staticmethod
+    def _sticky_class_for_role(role: str | None) -> str:
+        """将粘性列角色映射为外层单元格 CSS class。"""
+        if not role:
+            return ""
+        return f" mars-sticky-col mars-{role}-col"
+
+    @staticmethod
+    def _sticky_inner_class_for_role(role: str | None) -> str:
+        """将粘性列角色映射为内层单元格 CSS class。"""
+        if not role:
+            return ""
+        return " mars-sticky-cell-inner"
+
+    @staticmethod
+    def _build_scope_feedback_html(scope_id: str, *, empty_text: str) -> str:
+        """构建局部表格筛选状态和空结果提示区域。"""
+        return (
+            f'<div id="{scope_id}-status" class="mars-result-status" aria-live="polite"></div>'
+            f'<div id="{scope_id}-empty" class="mars-empty mars-scope-empty" hidden>{html.escape(empty_text)}</div>'
+        )
+
+    @classmethod
+    def _build_html_styles(cls: type["MarsEvaluationReport"]) -> str:
+        """返回评估 HTML 报告的样式表。"""
+        return build_html_styles()
+
+    @classmethod
+    def _build_html_runtime_script(
+        cls: type["MarsEvaluationReport"],
+        *,
+        summary_filter_columns: list[str],
+    ) -> str:
+        """返回评估 HTML 报告的前端交互脚本。"""
+        return build_html_runtime_script(summary_filter_columns)
+
+    @classmethod
+    def _build_html_document(
+        cls: type["MarsEvaluationReport"],
+        *,
+        report_name: str,
+        styles: str,
+        body_html: str,
+        runtime_script: str,
+    ) -> str:
+        """组装自包含 HTML 文档外壳。"""
+        template = """
+        <!DOCTYPE html>
+        <html lang="zh">
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>__TITLE__</title>
+            <style>
+__STYLES__
+            </style>
+        </head>
+        <body>
+__BODY_HTML__
+            <script>
+__RUNTIME_SCRIPT__
+            </script>
+        </body>
+        </html>
+        """
+        return (
+            template
+            .replace("__TITLE__", html.escape(report_name))
+            .replace("__STYLES__", styles)
+            .replace("__BODY_HTML__", body_html)
+            .replace("__RUNTIME_SCRIPT__", runtime_script)
+        )
+
+    @classmethod
+    def _build_global_tools_html(
+        cls: type["MarsEvaluationReport"],
+        *,
+        feature_jump_html: str,
+        source_options: str,
+    ) -> str:
+        """构建全局搜索、数据源过滤和导出工具条。"""
+        export_block_html = (
+            '<div class="mars-export-block">'
+            '<button type="button" class="mars-clear-button" onclick="marsExportFeatures()">Export Feature List</button>'
+            '<div class="mars-export-helper">Export uses Summary expression + Data Source only. Global and local searches only affect display.</div>'
+            '</div>'
+        )
+        return (
+            '<div class="mars-global-tools">'
+            '<div class="mars-search-cluster">'
+            '<input id="mars-global-search" class="mars-filter-input" type="search" placeholder="Global search across tables and charts..." oninput="marsSetGlobalQuery(this.value)" />'
+            '<button type="button" class="mars-clear-button" onclick="marsClearGlobalSearch()">Clear Search</button>'
+            '</div>'
+            '<label class="mars-toggle"><input id="mars-regex-mode" type="checkbox" onchange="marsSetRegexMode(this.checked)" /> Regex Mode</label>'
+            f'{feature_jump_html}'
+            '<div class="mars-source-panel">'
+            '<div class="mars-source-header">'
+            '<strong>Data Source</strong>'
+            '<div>'
+            '<button type="button" class="mars-source-link" onclick="marsSelectAllSources()">All</button>'
+            '<button type="button" class="mars-source-link" onclick="marsClearSources()">Clear</button>'
+            '</div>'
+            '</div>'
+            f'<div id="mars-data-source-group" class="mars-source-options">{source_options}</div>'
+            '</div>'
+            f'{export_block_html}'
+            '</div>'
+        )
+
+    def _build_summary_section_html(
+        self,
+        *,
+        summary_pd: pd.DataFrame,
+        feature_sources: Dict[str, str],
+        sort_by: str,
+        ascending: bool,
+    ) -> str | None:
+        """
+        构建特征汇总评估 section。
+
+        该 section 负责排序、字段显隐、阈值图例、表达式筛选框和增强表格
+        组装；汇总表为空时返回 ``None``。
+        """
+        if summary_pd.empty:
+            return None
+
+        summary_df = summary_pd.copy()
+        if sort_by in summary_df.columns:
+            summary_df = summary_df.sort_values(sort_by, ascending=ascending)
+        if "mono" in summary_df.columns:
+            summary_df = summary_df.drop(columns=["mono"])
+
+        summary_semantics = {col: self._semantic_for_metric(col) for col in summary_df.columns}
+        summary_percent_cols = [col for col in summary_df.columns if self._is_percent_column(col)]
+        summary_style_rules = {
+            col: self._summary_style_rule(col)
+            for col in summary_df.columns
+            if self._summary_style_rule(col) is not None
+        }
+        summary_legend_html = self._build_threshold_legend_html(
+            [
+                ("IV", "0.01 / 0.05 / 0.10, purple above 0.20"),
+                ("KS", "4 / 8 / 12, purple above 16"),
+                ("AUC", "0.525 / 0.55 / 0.575, purple above 0.625"),
+                ("PSI", "0 / 0.1 / 0.25"),
+                ("Missing", "0 / 0.5 / 1"),
+                ("Lift Min", "0.5 / 0.6 / 0.7 / 0.8, purple at or below 0.5"),
+                ("Lift Max", "1.2 / 1.3 / 1.4, purple above 1.5"),
+            ],
+            legend_id="mars-summary-legend",
+        )
+        summary_filter_html = (
+            '<div class="mars-summary-filter">'
+            '<label class="mars-summary-filter-label" for="mars-summary-expression">Feature Filter Expression</label>'
+            '<input id="mars-summary-expression" class="mars-filter-input" type="search" '
+            'placeholder="e.g. iv > 0.05 & (psi_max < 0.1 | missing < 0.2)" '
+            'oninput="marsSetSummaryExpression(this.value)" />'
+            '<div id="mars-summary-expression-error" class="mars-search-error"></div>'
+            '<div class="mars-footnote">Available metrics: iv, ks, auc, psi_max, rc_min, lift_min, lift_max, missing, missing_min, missing_max.</div>'
+            '<div class="mars-footnote">Supported operators: &gt;, &gt;=, &lt;, &lt;=, ==, !=, &amp;, |, ( ). Use &amp; for AND and | for OR.</div>'
+            f'{summary_legend_html}'
+            '</div>'
+        )
+        summary_table_html = self._build_enhanced_table_html(
+            summary_df,
+            "mars-summary-table",
+            search_placeholder="Search summary table...",
+            feature_sources=feature_sources,
+            semantic_map=summary_semantics,
+            percent_cols=summary_percent_cols,
+            style_rule_map=summary_style_rules,
+            extra_toolbar_html=summary_filter_html,
+            table_kind="summary",
+        )
+        return self._wrap_html_section(
+            "Summary",
+            summary_table_html,
+            "summary-section",
+            subtitle="Feature-level ranking and monitoring summary.",
+        )
+
+    def _build_trend_sections_html(
+        self,
+        *,
+        trend_pd_map: Dict[str, pd.DataFrame],
+        missing_by_day_pd: pd.DataFrame | None,
+        feature_sources: Dict[str, str],
+    ) -> List[Tuple[str, str, str]]:
+        """
+        构建缺失率日趋势和核心指标趋势 section 列表。
+
+        返回值中的元组依次为 section id、导航标题和 HTML 内容，供主页面
+        统一拼接导航和主体。
+        """
+        sections: List[Tuple[str, str, str]] = []
+
+        if missing_by_day_pd is not None and not missing_by_day_pd.empty:
+            missing_day_df = self._reorder_group_columns(missing_by_day_pd.copy(), ["feature", "dtype"])
+            missing_day_semantics = {col: "risk_high" for col in missing_day_df.columns if col not in {"feature", "dtype"}}
+            missing_day_percent_cols = [
+                col for col in missing_day_df.columns
+                if self._is_percent_column(col, metric_name="missing")
+            ]
+            missing_day_style_rules = {
+                col: self._trend_style_rule("missing")
+                for col in missing_day_df.columns
+                if col not in {"feature", "dtype"}
+            }
+            missing_day_html = self._build_enhanced_table_html(
+                missing_day_df,
+                "mars-missing-by-day",
+                search_placeholder="Search daily missing trend...",
+                feature_sources=feature_sources,
+                semantic_map=missing_day_semantics,
+                percent_cols=missing_day_percent_cols,
+                style_rule_map=missing_day_style_rules,
+            )
+            sections.append((
+                "missing-day-section",
+                "Missing By Day",
+                self._wrap_html_section(
+                    "Missing Trend By Day",
+                    missing_day_html,
+                    "missing-day-section",
+                    subtitle=f"Daily missing-rate trend derived from dt_col={self.dt_col}.",
+                ),
+            ))
+
+        trend_blocks: List[str] = []
+        trend_legend_html = self._build_threshold_legend_html(
+            [
+                ("Missing", "0 / 0.5 / 1"),
+                ("PSI", "0 / 0.1 / 0.25"),
+                ("IV", "0.01 / 0.05 / 0.10, purple above 0.20"),
+                ("KS", "4 / 8 / 12, purple above 16"),
+                ("Lift", "1.2 / 1.3 / 1.4, purple above 1.5"),
+                ("AUC", "0.525 / 0.55 / 0.575, purple above 0.625"),
+                ("Risk Corr", "0.2 / 0.5 / 0.8"),
+            ],
+            legend_id="mars-trend-legend",
+        )
+        for metric in ["missing", "psi", "iv", "ks", "lift", "auc", "risk_corr"]:
+            if metric not in trend_pd_map:
+                continue
+            trend_df = self._sort_metric_display_df(
+                self._reorder_group_columns(trend_pd_map[metric].copy(), ["feature", "dtype"])
+            )
+            trend_semantics = {col: self._semantic_for_metric(metric) for col in trend_df.columns if col not in {"feature", "dtype"}}
+            trend_percent_cols = [
+                col for col in trend_df.columns
+                if self._is_percent_column(col, metric_name=metric)
+            ]
+            trend_style_rules = {
+                col: self._trend_style_rule(metric)
+                for col in trend_df.columns
+                if col not in {"feature", "dtype"}
+            }
+            table_html = self._build_enhanced_table_html(
+                trend_df,
+                f"mars-trend-{self._slugify(metric)}",
+                search_placeholder=f"Search {metric} trend...",
+                feature_sources=feature_sources,
+                semantic_map=trend_semantics,
+                percent_cols=trend_percent_cols,
+                style_rule_map=trend_style_rules,
+            )
+            trend_blocks.append(f'<details class="mars-metric-block" open><summary>{html.escape(metric.upper())}</summary>{table_html}</details>')
+        if trend_blocks:
+            sections.append((
+                "trend-section",
+                "Trend Tables",
+                self._wrap_html_section(
+                    "Trend Tables",
+                    trend_legend_html + "".join(trend_blocks),
+                    "trend-section",
+                    subtitle="Trend tables with local search, default Total ranking, and Excel-like color scales.",
+                ),
+            ))
+
+        return sections
+
+    def _build_chart_section_html(
+        self,
+        *,
+        detail_pd: pd.DataFrame,
+        summary_pd: pd.DataFrame,
+        feature_sources: Dict[str, str],
+        max_plots: int,
+        sort_by: str,
+        ascending: bool,
+    ) -> str | None:
+        """
+        构建特征分箱风险趋势图 section。
+
+        方法会复用 ``MarsPlotter`` 的绘图路径，并按目标变量和排序配置生成
+        可筛选的图表卡片；无明细数据时返回 ``None``。
+        """
+        if detail_pd.empty:
+            return None
+
+        if "y" in detail_pd.columns:
+            chart_y_values = [
+                str(value)
+                for value in detail_pd["y"].dropna().astype(str).drop_duplicates().tolist()
+            ]
+        else:
+            chart_y_values = ["Target"]
+        chart_controls = (
+            '<div class="mars-inline-controls mars-chart-controls">'
+            '<input class="mars-filter-input mars-chart-search" type="search" '
+            'placeholder="Search chart features..." '
+            'oninput="marsSetLocalQuery(\'mars-chart-cards\', this.value)" />'
+            '<div id="mars-chart-cards-error" class="mars-search-error"></div>'
+        )
+        if len(chart_y_values) > 1:
+            chart_options = "".join(
+                f'<option value="{html.escape(y_val)}">{html.escape(y_val)}</option>'
+                for y_val in chart_y_values
+            )
+            chart_controls += (
+                '<label class="mars-select-group">Chart Target'
+                '<select id="mars-chart-target" onchange="marsHandleChartTargetChange()">'
+                f'{chart_options}</select></label>'
+            )
+        chart_controls += "</div>"
+
+        chart_views: List[str] = []
+        try:
+            from mars.utils.plotter import MarsPlotter
+
+            for y_val in chart_y_values:
+                if "y" in detail_pd.columns:
+                    chart_detail_pd = detail_pd[detail_pd["y"].astype(str) == y_val].copy()
+                else:
+                    chart_detail_pd = detail_pd.copy()
+
+                if "target" in summary_pd.columns:
+                    chart_summary_pd = summary_pd[
+                        summary_pd["target"].astype(str) == y_val
+                    ].copy()
+                else:
+                    chart_summary_pd = summary_pd.copy()
+                chart_sort_col = self._resolve_chart_sort_column(chart_summary_pd, sort_by)
+                if not chart_summary_pd.empty and chart_sort_col:
+                    chart_summary_pd = chart_summary_pd.sort_values(chart_sort_col, ascending=ascending)
+                if not chart_summary_pd.empty and "feature" in chart_summary_pd.columns:
+                    chart_features = chart_summary_pd["feature"].drop_duplicates().tolist()[:max_plots]
+                else:
+                    chart_features = chart_detail_pd["feature"].drop_duplicates().tolist()[:max_plots]
+
+                chart_cards: List[str] = []
+                for feature in chart_features:
+                    block_html = MarsPlotter.render_feature_binning_risk_trend_html(
+                        df_detail=chart_detail_pd,
+                        feature=feature,
+                        group_col=self.group_col or "mars_group",
+                        target_name=y_val,
+                        dpi=150,
+                    )
+                    if not block_html:
+                        continue
+                    data_source = feature_sources.get(str(feature), "UNMAPPED")
+                    chart_cards.append(
+                        f'<article class="mars-chart-card" data-feature="{self._escape_attr(feature)}" data-data-source="{self._escape_attr(data_source)}" '
+                        f'data-search-text="{self._escape_attr(self._normalize_search_text(feature, y_val, data_source))}"><h4>{html.escape(str(feature))}</h4>{block_html}</article>'
+                    )
+                if not chart_cards:
+                    chart_cards.append('<div class="mars-empty">No chart data available for this target.</div>')
+                chart_views.append(f'<div class="mars-chart-view" data-y-value="{self._escape_attr(y_val)}">{"".join(chart_cards)}</div>')
+        except Exception as exc:
+            logger.warning("HTML chart rendering skipped due to error: %s", exc)
+
+        if not chart_views:
+            for y_val in chart_y_values:
+                chart_views.append(
+                    f'<div class="mars-chart-view" data-y-value="{self._escape_attr(y_val)}">'
+                    f'<div class="mars-empty">Chart rendering is unavailable in the current environment.</div>'
+                    f"</div>"
+                )
+
+        chart_feedback_html = self._build_scope_feedback_html("mars-chart-cards", empty_text="No charts match current filters.")
+        return self._wrap_html_section(
+            "Charts",
+            chart_controls + chart_feedback_html + f'<div id="mars-chart-cards">{"".join(chart_views)}</div>',
+            "chart-section",
+            subtitle="Risk trend charts rendered from the shared plotting path.",
+            open_by_default=False,
+        )
+
+    @classmethod
+    def _build_threshold_style(
+        cls: type["MarsEvaluationReport"],
+        value: float,
+        rule: Dict[str, Any],
+    ) -> str:
+        """
+        将数值和阈值规则转换为单元格内联样式。
+
+        规则支持多锚点颜色插值和高值紫色强调，用于复刻 Excel 风格的
+        条件格式。
+        """
+        anchors = tuple(float(v) for v in rule["anchors"])
+        colors = tuple(rule["colors"])
+        purple_above = rule.get("purple_above")
+        purple_rgb = tuple(rule.get("purple_rgb", (160, 98, 196)))
+
+        if len(anchors) != len(colors):
+            raise ValueError("Threshold style rules require the same number of anchors and colors.")
+
+        red, green, blue = colors[-1]
+        if value <= anchors[0]:
+            red, green, blue = colors[0]
+        else:
+            segment_found = False
+            for idx in range(len(anchors) - 1):
+                start_anchor = anchors[idx]
+                end_anchor = anchors[idx + 1]
+                if value <= end_anchor:
+                    ratio = 0.5 if abs(end_anchor - start_anchor) < 1e-12 else (value - start_anchor) / (end_anchor - start_anchor)
+                    red, green, blue = cls._interpolate_rgb(colors[idx], colors[idx + 1], ratio)
+                    segment_found = True
+                    break
+            if not segment_found and purple_above is not None:
+                high = anchors[-1]
+                upper = float(purple_above)
+                ratio = 1.0 if abs(upper - high) < 1e-12 else min(max((value - high) / (upper - high), 0.0), 1.0)
+                red, green, blue = cls._interpolate_rgb(colors[-1], purple_rgb, ratio)
+
+        alpha = 0.84 if purple_above is not None and value >= float(purple_above) else 0.72
+        font_style = " color: #fff; font-weight: 600;" if purple_above is not None and value >= float(purple_above) else ""
+        return f"background-color: rgba({red}, {green}, {blue}, {alpha});{font_style}"
+
+    @classmethod
+    def _cell_style(
+        cls: type["MarsEvaluationReport"],
+        value: Any,
+        *,
+        semantic: str,
+        vmin: float | None,
+        vmax: float | None,
+        style_rule: Dict[str, Any] | None = None,
+        data_bar: bool = False,
+    ) -> str:
+        """
+        为 HTML 表格单元格生成条件格式样式。
+
+        该方法统一处理风险高为坏、指标高为好、发散指标和 data bar 四类
+        展示语义；无法解析为有限数值时返回空样式。
+        """
+        if cls._is_missing_html_value(value):
+            return ""
+
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return ""
+
+        if not np.isfinite(num):
+            return ""
+
+        styles: List[str] = []
+        if style_rule is not None:
+            styles.append(cls._build_threshold_style(num, style_rule))
+
+        if vmin is not None and vmax is not None and np.isfinite(vmin) and np.isfinite(vmax):
+            span = vmax - vmin
+            ratio = 0.5 if abs(span) < 1e-12 else (num - vmin) / span
+            ratio = max(0.0, min(1.0, ratio))
+            if style_rule is None:
+                if semantic == "risk_high":
+                    red, green, blue = cls._three_color_rgb(ratio, reverse=True)
+                    styles.append(f"background-color: rgba({red}, {green}, {blue}, 0.72);")
+                elif semantic == "good_high":
+                    red, green, blue = cls._three_color_rgb(ratio, reverse=False)
+                    styles.append(f"background-color: rgba({red}, {green}, {blue}, 0.72);")
+                elif semantic == "diverging":
+                    max_abs = max(abs(vmin), abs(vmax), 1e-12)
+                    diverging_ratio = min(abs(num) / max_abs, 1.0)
+                    if num >= 0:
+                        red, green, blue = cls._interpolate_rgb((255, 235, 132), (99, 190, 123), diverging_ratio)
+                    else:
+                        red, green, blue = cls._interpolate_rgb((255, 235, 132), (248, 105, 107), diverging_ratio)
+                    styles.append(f"background-color: rgba({red}, {green}, {blue}, 0.72);")
+
+            if data_bar and style_rule is None:
+                bar_ratio = ratio if semantic != "diverging" else min(abs(num) / max(abs(vmin), abs(vmax), 1e-12), 1.0)
+                bar_color = "#8bbf9d" if semantic not in {"risk_high", "diverging"} else "#ea8f8f"
+                if semantic == "good_high":
+                    bar_color = "#7fc68d"
+                if semantic == "diverging" and num >= 0:
+                    bar_color = "#7fc68d"
+                styles.append(
+                    f"background-image: linear-gradient(90deg, {bar_color} 0%, {bar_color} {bar_ratio * 100:.2f}%, transparent {bar_ratio * 100:.2f}%);"
+                    "background-repeat: no-repeat;"
+                )
+        return "".join(styles)
+
+    @classmethod
+    def _build_enhanced_table_html(
+        cls: type["MarsEvaluationReport"],
+        df: pd.DataFrame,
+        table_id: str,
+        *,
+        search_placeholder: str,
+        feature_sources: Dict[str, str] | None = None,
+        semantic_map: Dict[str, str] | None = None,
+        data_bar_cols: List[str] | None = None,
+        percent_cols: List[str] | None = None,
+        style_rule_map: Dict[str, Dict[str, Any]] | None = None,
+        extra_toolbar_html: str = "",
+        table_kind: str = "generic",
+        empty_text: str = "No data available.",
+    ) -> str:
+        """
+        构建带搜索、排序、粘性列和条件格式的 HTML 表格。
+
+        该方法是评估报告 v2 表格渲染的统一入口，负责把数据源、指标语义、
+        百分比格式和阈值样式编码进前端可识别的 ``data-*`` 属性。
+        """
+        if df.empty:
+            return f'<div class="mars-empty">{html.escape(empty_text)}</div>'
+
+        semantic_map = semantic_map or {}
+        data_bar_cols = set(data_bar_cols or [])
+        percent_cols = set(percent_cols or [])
+        style_rule_map = style_rule_map or {}
+        feature_sources = feature_sources or {}
+
+        sort_types = {
+            col: "number" if pd.api.types.is_numeric_dtype(df[col]) else "text"
+            for col in df.columns
+        }
+        numeric_bounds = {}
+        for col in df.columns:
+            if sort_types[col] == "number":
+                numeric_series = pd.to_numeric(df[col], errors="coerce")
+                if numeric_series.notna().any():
+                    numeric_bounds[col] = (float(numeric_series.min()), float(numeric_series.max()))
+                else:
+                    numeric_bounds[col] = (None, None)
+
+        header_cells = []
+        for col in df.columns:
+            sort_type = sort_types[col]
+            numeric_class = " is-numeric" if sort_type == "number" else ""
+            sticky_role = cls._table_sticky_role(col)
+            sticky_class = cls._sticky_class_for_role(sticky_role)
+            sticky_inner_class = cls._sticky_inner_class_for_role(sticky_role)
+            resize_handle = (
+                f'<span class="mars-resize-handle" onmousedown="marsStartColumnResize(event, \'{table_id}\', \'feature\')"></span>'
+                if sticky_role == "feature" else ""
+            )
+            header_cells.append(
+                f'<th class="mars-th{numeric_class}{sticky_class}" data-sort-type="{sort_type}" data-col-index="{len(header_cells)}">'
+                f'<button type="button" class="mars-sort-button{sticky_inner_class}" onclick="marsSortTable(\'{table_id}\', this)">'
+                f'<span class="mars-sort-label">{html.escape(str(col))}</span><span class="mars-sort-indicator"></span>'
+                f'</button>{resize_handle}</th>'
+            )
+
+        body_rows = []
+        for _, row in df.iterrows():
+            feature = str(row["feature"]) if "feature" in df.columns else ""
+            data_source = str(row.get("data_source", feature_sources.get(feature, "UNMAPPED")))
+            metric_payload = {
+                str(col): float(row[col])
+                for col in df.columns
+                if sort_types.get(col) == "number" and not cls._is_missing_html_value(row[col])
+            }
+            search_text = cls._normalize_search_text(
+                feature,
+                data_source,
+                *[
+                    cls._format_html_value(row[col], as_percent=(col in percent_cols))
+                    for col in df.columns
+                ],
+            )
+
+            row_cells = []
+            for col in df.columns:
+                sort_type = sort_types[col]
+                display_val = cls._format_html_value(row[col], as_percent=(col in percent_cols))
+                sort_val = cls._format_sort_value(row[col], sort_type)
+                numeric_class = " is-numeric" if sort_type == "number" else ""
+                semantic = semantic_map.get(col, "neutral")
+                style_rule = style_rule_map.get(col)
+                vmin, vmax = numeric_bounds.get(col, (None, None))
+                style = cls._cell_style(
+                    row[col],
+                    semantic=semantic,
+                    vmin=vmin,
+                    vmax=vmax,
+                    style_rule=style_rule,
+                    data_bar=col in data_bar_cols,
+                )
+                sticky_role = cls._table_sticky_role(col)
+                sticky_class = cls._sticky_class_for_role(sticky_role)
+                sticky_inner_class = cls._sticky_inner_class_for_role(sticky_role)
+                row_cells.append(
+                    f'<td class="mars-td{numeric_class}{sticky_class}" data-col="{cls._escape_attr(col)}" '
+                    f'data-sort-value="{cls._escape_attr(sort_val)}" style="{cls._escape_attr(style)}">'
+                    f'<span class="mars-cell-text{sticky_inner_class}">{html.escape(display_val)}</span></td>'
+                )
+
+            body_rows.append(
+                f'<tr data-feature="{cls._escape_attr(feature)}" data-data-source="{cls._escape_attr(data_source)}" '
+                f'data-search-text="{cls._escape_attr(search_text)}" '
+                f'data-metrics="{cls._escape_attr(json.dumps(metric_payload, ensure_ascii=False, separators=(",", ":")))}">'
+                f'{"".join(row_cells)}</tr>'
+            )
+
+        return f"""
+        <div id="{table_id}-wrap" class="mars-table-wrap">
+            <div class="mars-table-toolbar">
+                <input
+                    id="{table_id}-query"
+                    class="mars-filter-input"
+                    type="search"
+                    placeholder="{html.escape(search_placeholder)}"
+                    oninput="marsSetLocalQuery('{table_id}', this.value)"
+                />
+                <div id="{table_id}-error" class="mars-search-error"></div>
+            </div>
+            {extra_toolbar_html}
+            {cls._build_scope_feedback_html(table_id, empty_text="No rows match current filters.")}
+            <div class="mars-table-ownership-sentinel" data-table-id="{table_id}" data-sentinel-role="start" aria-hidden="true"></div>
+            <div class="mars-table-scroll" data-table-id="{table_id}">
+                <table id="{table_id}" class="mars-data-table" data-sort-col="" data-sort-dir="" data-table-kind="{cls._escape_attr(table_kind)}" style="--mars-feature-col-width: 220px; --mars-secondary-col-width: 110px;">
+                    <thead><tr>{''.join(header_cells)}</tr></thead>
+                    <tbody>{''.join(body_rows)}</tbody>
+                </table>
+            </div>
+            <div class="mars-table-ownership-sentinel" data-table-id="{table_id}" data-sentinel-role="end" aria-hidden="true"></div>
+        </div>
+        """
+
+    @classmethod
+    def _build_grouped_pivot_section_html(
+        cls: type["MarsEvaluationReport"],
+        detail_pd: pd.DataFrame,
+        *,
+        group_col: str,
+        feature_sources: Dict[str, str],
+    ) -> str:
+        """
+        构建按特征分箱和时间分组展开的透视 section。
+
+        该 section 将明细表聚合成首尾组、正常组和空值组三类视图，便于在
+        HTML 报告中横向比较各分组的风险、占比和 Lift。
+        """
+        if detail_pd.empty or group_col not in detail_pd.columns:
+            return '<div class="mars-empty">No grouped pivot data available.</div>'
+
+        work_df = detail_pd.copy()
+        if "bin_label" in work_df.columns:
+            work_df = work_df[work_df["bin_label"].astype(str) != "Total"]
+        work_df = work_df[work_df[group_col].astype(str) != "Total"]
+        if "bin_type" in work_df.columns:
+            work_df = work_df[work_df["bin_type"].astype(str).isin(["首尾组", "正常组", "空值组"])]
+        if work_df.empty:
+            return '<div class="mars-empty">No grouped pivot data available.</div>'
+
+        missing_idx = -1
+        try:
+            from mars.feature.base import MarsBinnerBase
+
+            missing_idx = int(MarsBinnerBase.IDX_MISSING)
+        except Exception:
+            missing_idx = -1
+
+        work_df["bin_index_num"] = pd.to_numeric(work_df.get("bin_index"), errors="coerce")
+        missing_mask = work_df["bin_index_num"].eq(missing_idx)
+        if "bin_label" in work_df.columns:
+            missing_mask = missing_mask | work_df["bin_label"].astype(str).str.lower().eq("missing")
+
+        max_bin_index = (
+            work_df.loc[~missing_mask, ["feature", group_col, "bin_index_num"]]
+            .groupby(["feature", group_col], dropna=False)["bin_index_num"]
+            .transform("max")
+        )
+        work_df["pivot_bin_type"] = np.where(
+            missing_mask,
+            "空值组",
+            np.where(
+                work_df["bin_index_num"].eq(0) | work_df["bin_index_num"].eq(max_bin_index),
+                "首尾组",
+                "正常组",
+            ),
+        )
+
+        if "data_source" not in work_df.columns:
+            work_df["data_source"] = work_df["feature"].map(feature_sources).fillna("UNMAPPED")
+        else:
+            work_df["data_source"] = work_df["data_source"].fillna("UNMAPPED")
+
+        y_values = (
+            [str(v) for v in work_df["y"].dropna().astype(str).drop_duplicates().tolist()]
+            if "y" in work_df.columns
+            else ["Target"]
+        )
+        control_parts = []
+        if len(y_values) > 1:
+            options = "".join(
+                f'<option value="{html.escape(y_value)}">{html.escape(y_value)}</option>'
+                for y_value in y_values
+            )
+            control_parts.append(
+                f'<label class="mars-select-group">Pivot Target'
+                f'<select id="mars-pivot-target" onchange="marsHandlePivotTargetChange()">{options}</select>'
+                f'</label>'
+            )
+
+        metrics = [
+            ("pct", "pct", "good_high", True, True),
+            ("risk", "risk", "risk_high", True, True),
+            ("lift", "lift", "good_high", False, True),
+            ("bad_count", "bad count", "risk_high", False, False),
+            ("total_count", "total count", "good_high", False, False),
+            ("iv", "iv", "good_high", False, False),
+        ]
+        view_blocks: List[str] = []
+
+        for y_val in y_values:
+            view_df = work_df.copy()
+            if "y" in view_df.columns:
+                view_df = view_df[view_df["y"].astype(str) == y_val]
+            if view_df.empty:
+                continue
+
+            for col in ["pct", "bad", "count", "lift", "iv_bin"]:
+                if col not in view_df.columns:
+                    view_df[col] = np.nan
+            view_df["bad"] = pd.to_numeric(view_df["bad"], errors="coerce").fillna(0.0)
+            view_df["count"] = pd.to_numeric(view_df["count"], errors="coerce").fillna(0.0)
+            view_df["pct"] = pd.to_numeric(view_df["pct"], errors="coerce").fillna(0.0)
+            view_df["lift"] = pd.to_numeric(view_df["lift"], errors="coerce")
+            view_df["iv_bin"] = pd.to_numeric(view_df["iv_bin"], errors="coerce").fillna(0.0)
+
+            grouped = (
+                view_df.groupby(
+                    ["feature", "bin_label", "bin_index", "pivot_bin_type", group_col],
+                    dropna=False,
+                )
+                .agg(
+                    bad_count=("bad", "sum"),
+                    total_count=("count", "sum"),
+                    lift=("lift", "max"),
+                    iv=("iv_bin", "sum"),
+                )
+                .reset_index()
+            )
+            group_denominator = grouped.groupby(
+                ["feature", group_col],
+                dropna=False,
+            )["total_count"].transform("sum")
+            grouped["pct"] = grouped["total_count"] / group_denominator.replace(0, np.nan)
+            grouped["pct"] = grouped["pct"].fillna(0.0)
+            grouped["risk"] = grouped["bad_count"] / (grouped["total_count"] + 1e-9)
+
+            totals = (
+                grouped.groupby(["feature", "bin_label", "bin_index", "pivot_bin_type"], dropna=False)
+                .agg(
+                    bad_count=("bad_count", "sum"),
+                    total_count=("total_count", "sum"),
+                    lift=("lift", "max"),
+                    iv=("iv", "sum"),
+                )
+                .reset_index()
+            )
+            feature_denominator = totals.groupby(["feature"], dropna=False)["total_count"].transform("sum")
+            totals["pct"] = totals["total_count"] / feature_denominator.replace(0, np.nan)
+            totals["pct"] = totals["pct"].fillna(0.0)
+            totals["risk"] = totals["bad_count"] / (totals["total_count"] + 1e-9)
+            totals[group_col] = "Total"
+            feature_rank = (
+                totals.groupby(["feature"], dropna=False)["iv"]
+                .sum()
+                .reset_index()
+                .sort_values(["iv", "feature"], ascending=[False, True])
+            )
+            grouped = pd.concat([grouped, totals], ignore_index=True, sort=False)
+            ordered_groups = ["Total"] + sorted(
+                [g for g in grouped[group_col].astype(str).unique().tolist() if g != "Total"]
+            )
+
+            metric_bounds = {}
+            for metric_key, _, _, _, _ in metrics:
+                vals = pd.to_numeric(grouped[metric_key], errors="coerce")
+                metric_bounds[metric_key] = (
+                    float(vals.min()) if vals.notna().any() else None,
+                    float(vals.max()) if vals.notna().any() else None,
+                )
+
+            header_top = [
+                '<th rowspan="2" class="mars-th mars-sticky-col mars-feature-col">Feature'
+                f'<span class="mars-resize-handle" onmousedown="marsStartColumnResize(event, \'mars-pivot-{cls._slugify(y_val)}\', \'feature\')"></span>'
+                '</th>',
+                '<th rowspan="2" class="mars-th mars-sticky-col mars-bin-col">Bin'
+                f'<span class="mars-resize-handle" onmousedown="marsStartColumnResize(event, \'mars-pivot-{cls._slugify(y_val)}\', \'bin\')"></span>'
+                '</th>',
+            ]
+            header_bottom: List[str] = []
+            for _, metric_label, _, _, _ in metrics:
+                header_top.append(
+                    f'<th class="mars-th is-numeric" colspan="{len(ordered_groups)}">{html.escape(metric_label)}</th>'
+                )
+                for group_value in ordered_groups:
+                    header_bottom.append(f'<th class="mars-th is-numeric">{html.escape(str(group_value))}</th>')
+
+            row_chunks: List[str] = []
+            total_columns = 2 + len(metrics) * len(ordered_groups)
+            grouped["bin_index"] = pd.to_numeric(grouped["bin_index"], errors="coerce")
+            grouped = grouped.sort_values(["feature", "bin_index", "bin_label", group_col], na_position="last")
+            feature_order = feature_rank["feature"].astype(str).tolist()
+            for feature in feature_order:
+                feature_df = grouped[grouped["feature"].astype(str) == feature].copy()
+                if feature_df.empty:
+                    continue
+                bin_frames = []
+                for (bin_label, bin_index, pivot_bin_type), bin_df in feature_df.groupby(
+                    ["bin_label", "bin_index", "pivot_bin_type"],
+                    dropna=False,
+                ):
+                    bin_frames.append((bin_index, str(bin_label), str(pivot_bin_type), bin_df.set_index(group_col)))
+
+                bin_frames.sort(key=lambda item: (float(item[0]) if pd.notna(item[0]) else np.inf, item[1]))
+                first_row = True
+                for _, bin_label, pivot_bin_type, row_df in bin_frames:
+                    row_cells = [
+                        f'<td class="mars-td mars-pivot-feature mars-sticky-col mars-feature-col{" mars-pivot-feature-blank" if not first_row else ""}"><span class="mars-cell-text mars-sticky-cell-inner">{html.escape(feature if first_row else "")}</span></td>',
+                        f'<td class="mars-td mars-pivot-bin mars-sticky-col mars-bin-col"><span class="mars-cell-text mars-sticky-cell-inner">{html.escape(bin_label)}</span></td>',
+                    ]
+                    for metric_key, _, semantic, is_percent, show_bar in metrics:
+                        vmin, vmax = metric_bounds[metric_key]
+                        for group_value in ordered_groups:
+                            value = row_df[metric_key].get(group_value, np.nan)
+                            display_val = cls._format_html_value(value, as_percent=is_percent)
+                            sort_val = cls._format_sort_value(value, "number")
+                            style = cls._cell_style(value, semantic=semantic, vmin=vmin, vmax=vmax, data_bar=show_bar)
+                            row_cells.append(
+                                f'<td class="mars-td is-numeric" data-col="{cls._escape_attr(metric_key)}|{cls._escape_attr(group_value)}" '
+                                f'data-sort-value="{cls._escape_attr(sort_val)}" style="{cls._escape_attr(style)}">{html.escape(display_val)}</td>'
+                            )
+
+                    search_text = cls._normalize_search_text(feature, bin_label, pivot_bin_type)
+                    row_chunks.append(
+                        f'<tr data-feature="{cls._escape_attr(feature)}" data-data-source="__aggregate__" '
+                        f'data-search-text="{cls._escape_attr(search_text)}">{"".join(row_cells)}</tr>'
+                    )
+                    first_row = False
+
+                row_chunks.append(
+                    f'<tr class="mars-pivot-spacer-row" data-role="spacer" data-feature="{cls._escape_attr(feature)}" '
+                    f'data-data-source="__aggregate__"><td colspan="{total_columns}"></td></tr>'
+                )
+
+            if row_chunks:
+                table_id = f"mars-pivot-{cls._slugify(y_val)}"
+                table_html = (
+                    f'<div class="mars-table-toolbar">'
+                    f'<input id="{table_id}-query" class="mars-filter-input" type="search" placeholder="Search grouped pivot..." '
+                    f'oninput="marsSetLocalQuery(\'{table_id}\', this.value)" />'
+                    f'<div id="{table_id}-error" class="mars-search-error"></div>'
+                    f'</div>'
+                    f'{cls._build_scope_feedback_html(table_id, empty_text="No grouped pivot rows match current filters.")}'
+                    f'<div class="mars-table-ownership-sentinel" data-table-id="{cls._escape_attr(table_id)}" data-sentinel-role="start" aria-hidden="true"></div>'
+                    f'<div class="mars-table-scroll" data-table-id="{cls._escape_attr(table_id)}">'
+                    f'<table id="{table_id}" class="mars-data-table mars-pivot-table" data-sort-col="" data-sort-dir="" data-table-kind="pivot" style="--mars-feature-col-width: 220px; --mars-bin-col-width: 140px;">'
+                    f'<thead><tr>{"".join(header_top)}</tr><tr>{"".join(header_bottom)}</tr></thead>'
+                    f'<tbody>{"".join(row_chunks)}</tbody></table></div>'
+                    f'<div class="mars-table-ownership-sentinel" data-table-id="{cls._escape_attr(table_id)}" data-sentinel-role="end" aria-hidden="true"></div>'
+                )
+                view_blocks.append(
+                    f'<div class="mars-pivot-view" data-y-value="{cls._escape_attr(y_val)}">'
+                    f'<div class="mars-view-label">{html.escape(y_val)}</div>{table_html}</div>'
+                )
+
+        if not view_blocks:
+            return '<div class="mars-empty">No grouped pivot data available.</div>'
+        controls_html = f'<div class="mars-inline-controls">{"".join(control_parts)}</div>' if control_parts else ""
+        return controls_html + "".join(view_blocks)
+
+    def write_html(
+        self,
+        path: str = "mars_bin_report.html",
+        *,
+        report_name: str = "MARS Evaluation Report",
+        max_plots: int = 20,
+        sort_by: str = "iv",
+        ascending: bool = False,
+        include_summary: bool = True,
+        include_trends: bool = True,
+        include_detail: bool = True,
+        include_charts: bool = True,
+    ) -> None:
+        """
+        导出自包含的交互式 HTML 报告。
+
+        Parameters
+        ----------
+        path : str
+            输出文件路径。
+        report_name : str
+            HTML 页面标题与报告名称。
+        max_plots : int
+            图表区域最多展示的特征数量。
+        sort_by : str
+            图表和汇总视图默认使用的排序指标。
+        ascending : bool
+            是否按 ``sort_by`` 升序排列。
+        include_summary : bool
+            是否包含汇总表区域。
+        include_trends : bool
+            是否包含趋势分析区域。
+        include_detail : bool
+            是否包含分箱明细区域。
+        include_charts : bool
+            是否包含图表区域。
+
+        Notes
+        -----
+        导出的 HTML 为单文件报告，适合脱离 Notebook 独立分享或归档。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> from pathlib import Path
+        >>> from tempfile import TemporaryDirectory
+        >>> summary = pl.DataFrame({"feature": ["age"], "iv": [0.12], "ks": [18.0]})
+        >>> detail = pl.DataFrame({"feature": ["age"], "bin_index": [0], "count": [100]})
+        >>> report = MarsEvaluationReport(summary, {}, detail)
+        >>> with TemporaryDirectory() as tmp:
+        ...     path = Path(tmp) / "report.html"
+        ...     report.write_html(str(path), include_charts=False, include_detail=False)
+        ...     path.exists()
+        True
+        """
+        return self._write_html_v2(
+            path=path,
+            report_name=report_name,
+            max_plots=max_plots,
+            sort_by=sort_by,
+            ascending=ascending,
+            include_summary=include_summary,
+            include_trends=include_trends,
+            include_detail=include_detail,
+            include_charts=include_charts,
+        )
+
+    def _write_html_v2(
+        self,
+        *,
+        path: str,
+        report_name: str,
+        max_plots: int,
+        sort_by: str,
+        ascending: bool,
+        include_summary: bool,
+        include_trends: bool,
+        include_detail: bool,
+        include_charts: bool,
+    ) -> None:
+        """
+        写入新版自包含 HTML 评估报告。
+
+        方法负责收集汇总表、明细表、趋势表、图表和数据源筛选配置，随后
+        组装导航、概览、各业务 section 与运行脚本并写入目标路径。
+        """
+        summary_pd = _as_pandas_frame(self.summary_table).copy()
+        detail_pd = _as_pandas_frame(self.detail_table).copy()
+        trend_pd_map = {metric: _as_pandas_frame(df).copy() for metric, df in self.trend_tables.items()}
+        missing_by_day_pd = _as_pandas_frame(self.missing_by_day_table).copy() if self.missing_by_day_table is not None else None
+
+        _ = include_detail
+        feature_sources = dict(self.feature_data_source or {})
+        if not feature_sources and not summary_pd.empty and {"feature", "data_source"}.issubset(summary_pd.columns):
+            feature_sources = dict(
+                zip(
+                    summary_pd["feature"].astype(str),
+                    summary_pd["data_source"].astype(str),
+                    strict=False,
+                )
+            )
+        if not feature_sources and not detail_pd.empty and {"feature", "data_source"}.issubset(detail_pd.columns):
+            source_df = detail_pd[["feature", "data_source"]].dropna().drop_duplicates()
+            feature_sources = dict(
+                zip(
+                    source_df["feature"].astype(str),
+                    source_df["data_source"].astype(str),
+                    strict=False,
+                )
+            )
+
+        n_features = len(summary_pd) if not summary_pd.empty else detail_pd["feature"].nunique() if "feature" in detail_pd.columns else 0
+        group_label = self.group_col if self.group_col else "None (Total Only)"
+        all_sources = sorted(
+            set(feature_sources.values())
+            | set(summary_pd["data_source"].astype(str).tolist() if "data_source" in summary_pd.columns else [])
+            | set(detail_pd["data_source"].astype(str).tolist() if "data_source" in detail_pd.columns else [])
+        )
+        safe_report_name = report_name or "MARS Evaluation Report"
+        summary_filter_columns = [
+            "iv", "ks", "auc", "psi_max", "rc_min",
+            "lift_min", "lift_max",
+            "missing", "missing_min", "missing_max",
+        ]
+        feature_jump_html = self._build_feature_jump_html(
+            summary_pd["feature"].astype(str).tolist() if "feature" in summary_pd.columns else detail_pd["feature"].astype(str).tolist() if "feature" in detail_pd.columns else []
+        )
+
+        html_parts: List[str] = []
+        nav_items: List[Tuple[str, str]] = []
+
+        overview_html = self._build_dataset_overview_html(self.report_meta)
+        if overview_html:
+            html_parts.append(self._wrap_html_section("Dataset Overview", overview_html, "overview-section", subtitle="Dataset context, grouping setup, and target-level baseline stats."))
+            nav_items.append(("overview-section", "Overview"))
+
+        if include_summary:
+            summary_html = self._build_summary_section_html(
+                summary_pd=summary_pd,
+                feature_sources=feature_sources,
+                sort_by=sort_by,
+                ascending=ascending,
+            )
+            if summary_html:
+                html_parts.append(summary_html)
+                nav_items.append(("summary-section", "Summary"))
+
+        if include_trends:
+            for section_id, label, section_html in self._build_trend_sections_html(
+                trend_pd_map=trend_pd_map,
+                missing_by_day_pd=missing_by_day_pd,
+                feature_sources=feature_sources,
+            ):
+                html_parts.append(section_html)
+                nav_items.append((section_id, label))
+
+        if not detail_pd.empty:
+            pivot_body = self._build_grouped_pivot_section_html(
+                detail_pd,
+                group_col=self.group_col or "mars_group",
+                feature_sources=feature_sources,
+            )
+            html_parts.append(
+                self._wrap_html_section(
+                    "Grouped Pivot",
+                    pivot_body,
+                    "pivot-section",
+                    subtitle="Binned distribution and risk comparison across groups.",
+                    open_by_default=False,
+                )
+            )
+            nav_items.append(("pivot-section", "Grouped Pivot"))
+
+        if include_charts:
+            chart_html = self._build_chart_section_html(
+                detail_pd=detail_pd,
+                summary_pd=summary_pd,
+                feature_sources=feature_sources,
+                max_plots=max_plots,
+                sort_by=sort_by,
+                ascending=ascending,
+            )
+            if chart_html:
+                html_parts.append(chart_html)
+                nav_items.append(("chart-section", "Charts"))
+
+        nav_html = "".join(
+            f'<a href="#{html.escape(section_id)}">{html.escape(label)}</a>'
+            for section_id, label in nav_items
+        )
+        source_options = "".join(
+            f'<label class="mars-source-option"><input type="checkbox" class="mars-source-checkbox" '
+            f'value="{html.escape(source)}" checked onchange="marsHandleDataSourceToggle()" />'
+            f'<span>{html.escape(source)}</span></label>'
+            for source in all_sources
+        )
+
+
+        sections_html = "".join(html_parts)
+        global_tools_html = self._build_global_tools_html(
+            feature_jump_html=feature_jump_html,
+            source_options=source_options,
+        )
+        body_html = f"""
+            <div id="mars-page-top" aria-hidden="true"></div>
+            <div id="mars-floating-header-host" class="mars-floating-header-host" hidden>
+                <div id="mars-floating-header-scroll" class="mars-floating-header-scroll"></div>
+            </div>
+            <div class="mars-page">
+                <div class="mars-hero">
+                    <h1>{html.escape(safe_report_name)}</h1>
+                    <p>Interactive monitoring report with source-aware tables, Excel-like color scales, grouped pivot views, and shared trend charts.</p>
+                    <div class="mars-meta">
+                        <div class="mars-pill">Features: {n_features}</div>
+                        <div class="mars-pill">Trend Metrics: {len(trend_pd_map)}</div>
+                        <div class="mars-pill">Group By: {html.escape(str(group_label))}</div>
+                    </div>
+                    {global_tools_html}
+                    <div id="mars-global-error" class="mars-search-error"></div>
+                </div>
+                <div class="mars-nav">{nav_html}</div>
+                {sections_html}
+                <div class="mars-footnote">HTML export is self-contained. detail_table remains available in Python and Excel workflows.</div>
+            </div>
+            <button id="mars-back-to-top" class="mars-back-to-top" type="button" aria-label="Back to top" onclick="marsBackToTop()">Top</button>
+        """
+        page_html = self._build_html_document(
+            report_name=safe_report_name,
+            styles=self._build_html_styles(),
+            body_html=body_html,
+            runtime_script=self._build_html_runtime_script(summary_filter_columns=summary_filter_columns),
+        )
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page_html)
+
+        logger.info("Exported evaluation report to HTML: %s", path)
+
+    def show_summary(self,
+                     features: Union[str, List[str]] | None = None
+                     ) -> "pd.io.formats.style.Styler":
+        """
+        展示特征汇总评分表。
+
+        Parameters
+        ----------
+        features : Union[str, List[str]] | None
+            需要展示的特征名称。若为 ``None``，展示全部特征。
+
+        Returns
+        -------
+        pd.io.formats.style.Styler
+            样式化后的特征汇总表。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> summary = pl.DataFrame({"feature": ["age"], "iv": [0.12], "ks": [18.0]})
+        >>> report = MarsEvaluationReport(summary, {}, pl.DataFrame())
+        >>> hasattr(report.show_summary(features="age"), "to_html")
+        True
+        """
+        df: pd.DataFrame = _as_pandas_frame(self.summary_table).copy()
+
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
+
+        # 多目标模式下，将 target 列提前，便于快速按目标查看结果。
+        for t_col in ["target", "target_col", "y"]:
+            if t_col in df.columns:
+                cols = [t_col] + [c for c in df.columns if c != t_col]
+                df = df[cols]
+                break
+
+        styler = df.style.set_caption("<b>Feature Performance Summary</b>").hide(axis="index")
+
+        # 异常熔断：如果筛选后为空，直接返回表框架，避免底图渲染报错
+        if df.empty:
+            return styler
+
+        if "psi_max" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn_r", subset=["psi_max"], vmin=0, vmax=0.25)
+
+        if "iv" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["iv"], vmin=0.02, vmax=0.2)
+        if "auc" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["auc"], vmin=0.5, vmax=0.65)
+        if "ks" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["ks"], vmin=5, vmax=20)
+
+        if "rc_min" in df.columns:
+            styler = styler.background_gradient(cmap="RdYlGn", subset=["rc_min"], vmin=0.5, vmax=1.0)
+
+        if "mono" in df.columns:
+            # coolwarm 色带: -1 为深蓝(单调递减)，0 为灰白(无单调性)，1 为深红(单调递增)
+            styler = styler.background_gradient(cmap="coolwarm", subset=["mono"], vmin=-1, vmax=1)
+
+        return styler.format("{:.4f}", subset=df.select_dtypes("number").columns)
+
+    def show_trend(self,
+                   metric: str,
+                   features: Union[str, List[str]] | None = None,
+                   group_ascending: bool = True,
+                   sort_by: Union[str, List[str]] = "Total",
+                   sort_ascending: bool = False) -> "pd.io.formats.style.Styler":
+        """
+        展示指定指标的时间趋势热力图。
+
+        渲染并返回一个带条件格式 (Conditional Formatting) 的 Pandas Styler 对象，
+        用于直观分析特征在不同时间切片（或客群分组）下的指标波动趋势。内置了针对
+        风控业务语义优化的专属色盘 (Colormap)。
+
+        Parameters
+        ----------
+        metric : str
+            需要展示的指标名称。支持的选项可通过 `self.trend_tables.keys()` 查看
+            (通常包含 'psi', 'auc', 'ks', 'iv', 'bad_rate', 'risk_corr')。
+        features : Union[str, List[str]] | None
+            需要展示的特征名列表。若为 None，则展示所有特征。
+        group_ascending : bool
+            分组/时间切片列的排序方向 (横向)。True 表示正序（从左到右由旧到新 / 由小到大）。
+        sort_by : Union[str, List[str]]
+            特征行的排序依据列。默认按照全局表现 (Total) 排序。
+        sort_ascending : bool
+            特征行的排序方向 (纵向)。默认降序 (False)，即把表现最差/最好的特征排在最上面。
+
+        Returns
+        -------
+        pd.io.formats.style.Styler
+            渲染完成的热力图对象。在 Jupyter Notebook 环境下会自动渲染为精美表格。
+
+        Raises
+        ------
+        ValueError
+            当 ``metric`` 不在当前报告支持的趋势指标集合中时抛出。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> trend = pl.DataFrame({"feature": ["age"], "2026-01": [0.01], "Total": [0.01]})
+        >>> report = MarsEvaluationReport(pl.DataFrame(), {"psi": trend}, pl.DataFrame())
+        >>> hasattr(report.show_trend("psi", features="age"), "to_html")
+        True
+        """
+        if metric not in self.trend_tables:
+            raise ValueError(f"Unknown metric: {metric}. Options: {list(self.trend_tables.keys())}")
+
+        # 转换为 Pandas 副本进行安全的样式处理
+        df: pd.DataFrame = _as_pandas_frame(self.trend_tables[metric]).copy()
+
+        # 特征筛选逻辑
+        if features is not None:
+            if isinstance(features, str):
+                features = [features]
+            df = df[df["feature"].isin(features)]
+
+        # 行排序：紧跟 sort_by 和 sort_ascending 语义
+        if sort_by in df.columns or (isinstance(sort_by, list) and all(c in df.columns for c in sort_by)):
+            df = df.sort_values(by=sort_by, ascending=sort_ascending)
+
+        # 识别列类型并重排时间切片列
+        meta_cols = ["feature", "dtype"]
+        special_cols = ["Total"]
+        time_cols = [c for c in df.columns if c not in meta_cols + special_cols]
+
+        # 列排序：受 group_ascending 控制
+        time_cols_sorted = sorted(time_cols, reverse=not group_ascending)
+
+        # 组装最终的列顺序：元数据 -> 时间切片 -> 汇总列
+        final_cols = (
+            [c for c in meta_cols if c in df.columns]
+            + time_cols_sorted
+            + [c for c in special_cols if c in df.columns]
+        )
+        df = df[final_cols]
+
+        # 基础表格样式初始化
+        styler = df.style.set_caption(f"<b>Trend Analysis: {metric.upper()}</b>").hide(axis="index")
+        styler = styler.set_properties(subset=["feature"], **{'text-align': 'left', 'font-weight': 'bold'})
+
+        if df.empty:
+            return styler # 如果筛选后为空，直接返回空表格框架，避免报错
+
+        # 根据不同业务指标的阈值与方向，映射专属渐变色盘
+        if metric == "psi":
+            styler = styler.background_gradient(
+                cmap="RdYlGn_r", subset=time_cols_sorted, vmin=0, vmax=0.25, axis=None
+            )
+        elif metric in ["auc", "ks", "iv"]:
+            styler = styler.background_gradient(
+                cmap="RdYlGn", subset=time_cols_sorted, axis=None
+            )
+        elif metric == "bad_rate":
+            styler = styler.background_gradient(
+                cmap="Blues", subset=time_cols_sorted, axis=None
+            )
+        elif metric == "risk_corr":
+            styler = styler.background_gradient(
+                cmap="RdYlGn", subset=time_cols_sorted, vmin=0.5, vmax=1.0, axis=None
+            )
+
+        # 统一数值精度
+        format_cols = [c for c in df.select_dtypes(include=[np.number]).columns]
+        return styler.format("{:.4f}", subset=format_cols)
+
+
+    def write_excel(self, path: str = "mars_bin_report.xlsx", engine: str = "openpyxl") -> None:
+        """
+        导出评估 Excel 报告。
+
+        Parameters
+        ----------
+        path : str
+            导出的 Excel 文件路径。
+        engine : str
+            写入 Excel 的底层引擎。
+            - "auto": 自动检测，Win/Mac 下优先尝试 xlwings，若失败或在 Linux 下则回退至 openpyxl。
+            - "xlwings": 强制使用 xlwings 引擎 (依赖本地安装的 Excel 应用程序，格式保留最完美)。
+            - "openpyxl": 强制使用 openpyxl 引擎 (无需安装 Excel，跨平台兼容性好)。
+
+        Raises
+        ------
+        ValueError
+            当 ``engine`` 不在支持列表中时抛出。
+        FileNotFoundError
+            当内置 Excel 模板文件缺失时抛出。
+        RuntimeError
+            当底层 Excel 导出流程失败时抛出。
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> from pathlib import Path
+        >>> from tempfile import TemporaryDirectory
+        >>> summary = pl.DataFrame({"feature": ["age"], "iv": [0.12], "ks": [18.0]})
+        >>> detail = pl.DataFrame({"feature": ["age"], "bin_index": [0], "count": [100]})
+        >>> report = MarsEvaluationReport(summary, {}, detail)
+        >>> with TemporaryDirectory() as tmp:
+        ...     report.write_excel(str(Path(tmp) / "evaluation.xlsx"), engine="openpyxl") is None
+        True
+        """
+        valid_engines = ["auto", "xlwings", "openpyxl"]
+        if engine not in valid_engines:
+            raise ValueError(f"不支持的 engine: '{engine}'，请从 {valid_engines} 中选择。")
+
+        # 智能定位模板路径
+        package_name = "mars.analysis"
+        template_name_xlwings = "mars_bin_report_win_mac.xlsx"
+        template_name_openpyxl = "mars_bin_report_linux.xlsx"
+
+        def get_template_path(fname: str) -> str:
+            """解析 Excel 模板文件的物理路径。"""
+            try:
+                import importlib.resources as resources
+                with resources.as_file(resources.files(package_name).joinpath(fname)) as p:
+                    return str(p)
+            except Exception:
+                return os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+
+        # 配置内部参数
+        START_WRITE_ROW = 4
+        STYLE_SOURCE_ROW = 2
+        FONT_NAME = "Microsoft YaHei"
+        FONT_SIZE = 8
+        SHEET_NAME = "分组明细"
+
+        # 引擎解析与初始化
+        use_xlwings = False
+
+        if engine == "xlwings":
+            use_xlwings = True
+        elif engine == "openpyxl":
+            use_xlwings = False
+        else:  # 自动选择导出引擎。
+            # 自动探测环境
+            is_gui_env = sys.platform.startswith("win") or sys.platform.startswith("darwin")
+            use_xlwings = is_gui_env
+
+        # 验证 xlwings 可用性
+        if use_xlwings:
+            try:
+                import xlwings as xw
+                # 测试 Excel 应用程序是否真正可用
+                xw.App(visible=False, add_book=False).quit()
+                template_path = get_template_path(template_name_xlwings)
+            except Exception as e:
+                if engine == "xlwings":
+                    # 用户强制要求但失败，直接抛错
+                    raise RuntimeError(
+                        "强制使用 xlwings 引擎失败，请确认系统已正确安装 Excel 及 xlwings 库。"
+                        f"\n报错详情: {e}"
+                    ) from e
+                else:
+                    # auto 模式下失败，降级处理
+                    logger.warning("xlwings 启动失败，将降级使用 openpyxl 引擎: %s", e)
+                    use_xlwings = False
+
+        # 若未使用 xlwings，则准备 openpyxl 依赖
+        if not use_xlwings:
+            import openpyxl
+            from openpyxl.utils import get_column_letter
+            from openpyxl.worksheet.table import Table, TableStyleInfo
+            template_path = get_template_path(template_name_openpyxl)
+
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"找不到模板文件: {template_path}")
+
+        # 准备数据
+        df_pd = _as_pandas_frame(self.detail_table)
+        total_cols = len(df_pd.columns)
+
+        # ================= 路径 A: xlwings 写入 (Win/Mac 跨平台兼容) =================
+        if use_xlwings:
+            app = None
+            try:
+                app = xw.App(visible=False, add_book=False)
+                app.display_alerts = False
+                app.screen_updating = False
+
+                wb = app.books.open(template_path)
+                ws = wb.sheets[SHEET_NAME]
+
+                # 防止 Excel 将长数字字符串转为科学计数法
+                if 'mars_group' in df_pd.columns:
+                    df_pd['mars_group'] = "'" + df_pd['mars_group'].astype(str)
+
+                # 模板可能落后于明细表结构，先同步表头再写入数据。
+                ws.range((1, 1)).value = [df_pd.columns.tolist()]
+
+                # 写入数据
+                ws.range((START_WRITE_ROW, 1)).value = df_pd.values
+                final_row = START_WRITE_ROW + len(df_pd) - 1
+
+                # 样式格式刷 (跨平台原生写法)
+                if final_row >= START_WRITE_ROW:
+                    src_row = int(STYLE_SOURCE_ROW)
+                    start_row = int(START_WRITE_ROW)
+                    end_row = int(final_row)
+                    max_col = int(total_cols)
+
+                    source_range = ws.range((src_row, 1), (src_row, max_col))
+                    data_range = ws.range((start_row, 1), (end_row, max_col))
+
+                    source_range.copy()
+                    data_range.paste(paste='formats')
+
+                # 统一字体 (跨平台原生写法)
+                full_range = ws.range((1, 1), (final_row, total_cols))
+                full_range.font.name = FONT_NAME
+                full_range.font.size = FONT_SIZE
+
+                # 更新超级表 ListObject (跨平台原生写法)
+                if len(ws.tables) > 0:
+                    table = ws.tables[0]
+                    new_ref_range = ws.range((1, 1), (final_row, total_cols))
+                    table.resize(new_ref_range)
+
+                # 清理旧数据 (跨平台原生写法)
+                last_used_row = ws.used_range.last_cell.row
+                if last_used_row > final_row:
+                    ws.range(f"{final_row + 1}:{last_used_row}").delete()
+
+                wb.save(path)
+                logger.info("Exported evaluation report via xlwings: %s", path)
+
+            except Exception as e:
+                logger.exception("xlwings 导出过程出错。")
+                raise RuntimeError(f"xlwings 导出过程出错: {e}") from e
+            finally:
+                if "wb" in locals() and wb:
+                    wb.close()
+                if app:
+                    app.quit()
+
+        # ================= 路径 B: openpyxl 写入 (Linux 等无界面的兜底方案) =================
+        else:
+            wb = openpyxl.load_workbook(template_path)
+            ws = wb[SHEET_NAME]
+
+            mars_group_idx = -1
+            if "mars_group" in df_pd.columns:
+                mars_group_idx = list(df_pd.columns).index("mars_group") + 1
+
+            # 模板可能落后于明细表结构，先同步表头再写入数据。
+            for c_offset, column_name in enumerate(df_pd.columns):
+                ws.cell(row=1, column=c_offset + 1, value=column_name)
+
+            # 提取并缓存样式模板
+            style_map = {}
+            for c in range(1, total_cols + 1):
+                cell = ws.cell(row=STYLE_SOURCE_ROW, column=c)
+                style_map[c] = {
+                    "font": copy(cell.font),
+                    "border": copy(cell.border),
+                    "fill": copy(cell.fill),
+                    "alignment": copy(cell.alignment),
+                    "number_format": cell.number_format
+                }
+
+            # 写入数据
+            rows = df_pd.values.tolist()
+            for r_offset, row_data in enumerate(rows):
+                current_row = START_WRITE_ROW + r_offset
+                for c_offset, value in enumerate(row_data):
+                    c_idx = c_offset + 1
+                    cell = ws.cell(row=current_row, column=c_idx, value=value)
+
+                    # 应用样式
+                    if c_idx in style_map:
+                        s = style_map[c_idx]
+                        cell.font = s["font"]
+                        cell.border = s["border"]
+                        cell.fill = s["fill"]
+                        cell.alignment = s["alignment"]
+                        cell.number_format = s["number_format"]
+
+                    # 日期列单独处理
+                    if c_idx == mars_group_idx:
+                        cell.number_format = "yyyy-mm-dd"
+
+            final_row = START_WRITE_ROW + len(rows) - 1
+
+            # 更新超级表范围并容错
+            if hasattr(ws, 'tables') and ws.tables:
+                new_ref = f"A1:{get_column_letter(total_cols)}{final_row}"
+                for tbl_name in list(ws.tables.keys()):
+                    tbl_obj = ws.tables[tbl_name]
+
+                    if hasattr(tbl_obj, 'ref'):
+                        tbl_obj.ref = new_ref
+                    else:
+                        # 容错：处理 openpyxl 偶尔将 Table 解析为纯字符串的问题
+                        del ws.tables[tbl_name]
+                        new_tbl = Table(displayName=tbl_name, ref=new_ref)
+                        style = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
+                        new_tbl.tableStyleInfo = style
+                        ws.add_table(new_tbl)
+
+            # 删除多余行
+            if ws.max_row > final_row:
+                ws.delete_rows(final_row + 1, ws.max_row - final_row)
+
+            wb.save(path)
+            logger.info("Exported evaluation report via openpyxl: %s", path)

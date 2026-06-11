@@ -1,31 +1,68 @@
-# --- Python 垃圾文件 ---
+#  Python 垃圾文件
 __pycache__/
+.VSCodeCounter/
 *.py[cod]
 *$py.class
 
-# --- 虚拟环境 (不要上传环境库) ---
+# 虚拟环境
 venv/
 .venv/
 mars_env/
 
-# --- IDE 配置 (不要上传编辑器设置) ---
+# IDE 配置
 .idea/
 .vscode/
 .DS_Store
 
-# --- 构建打包文件 ---
+# 构建打包文件
 dist/
 build/
+site/
 *.egg-info/
+.pytest_cache/
+.pytest-tmp/
+.pytest-tmp*/
+.ruff_cache/
+.mypy_cache/
+.cache/
+*.tmp
+*.log
 
-# --- 数据与隐私 ---
+# 数据与隐私 
 *.csv
-*.xlsx
-*.xls
 *.parquet
 *.pkl
 data/
 output/
 secret_config.py
 .env
-.ipynb
+*.local
+
+# Jupyter Notebooks
+*.ipynb
+!docs/**/*.ipynb
+.ipynb_checkpoints/
+
+# 示例文件
+examples/
+modeling_artifacts/
+*_report.html
+*_report.xlsx
+mars_profile.html
+mars_profile.xlsx
+mars_selector_report.xlsx
+mars_lists.json
+
+# 测试与教程运行产物
+tests/_artifacts/
+tutorial/__pycache__/
+tutorial/**/*.ipynb
+tutorial/**/*.parquet
+tutorial/**/*.xlsx
+tutorial/**/*.html
+tutorial/**/*.zip
+tutorial/modeling_artifacts/
+benchmarks/_artifacts/
+tutorial/*.tmp
+tutorial/*.log
+.html

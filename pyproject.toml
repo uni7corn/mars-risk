@@ -4,56 +4,225 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mars-risk"      
-version = "0.0.2"       
+version = "0.0.16"       
 description = "High-performance Risk Modeling Toolkit powered by Polars"
 readme = "README.md"
-requires-python = ">=3.10" # 推荐 3.10 或 3.11 以获得最佳性能
+requires-python = ">=3.10" 
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
 license = {file = "LICENSE"}
-keywords = ["risk", "scorecard", "polars", "credit-scoring", "feature-engineering"]
+keywords = ["risk", "scorecard", "polars", "credit-scoring", "feature-binning", "modeling", "machine-learning"]
 authors = [
   {name = "christian", email = "lee_sq001@163.com"}
 ]
 
-# 核心依赖列表 (The Golden Standard)
 dependencies = [
-    # 1. 数据引擎 (Data Engine)
-    "polars>=1.0.0",       # 核心算力
-    "numpy>=1.24.0",       # 数值计算基础
-    "pandas>=2.0.0",       # 兼容性/接口适配
-    "pyarrow>=14.0.0",     # 零拷贝交换 (Polars <-> Pandas)
+    "polars>=1.33.1",     
+    "numpy>=1.24.0",      
+    "pandas>=2.0.0",     
+    "pyarrow>=14.0.0",    
 
-    # 2. 算法核心 (Algorithms)
-    "scikit-learn>=1.3.0", # 用于 NativeBinner 的决策树分箱
-    "scipy>=1.10.0",       # 基础统计 (Sklearn 依赖)
-    "optbinning>=0.19.0",  # 【新增】MarsOptimalBinner 必须依赖它
-
-    # 3. 基础工具 (Utils)
-    "joblib>=1.3.0",       # 并行计算 (MarsNativeBinner/OptimalBinner)
-    "colorlog>=6.7.0",     # 日志美化
+    "scikit-learn>=1.7.2", 
+    "scipy>=1.10.0",       
+    "optbinning>=0.19.0",  
+    
+    "joblib>=1.3.0",       
+    "colorlog>=6.7.0",  
+    "tqdm>=4.66.0",
+    "ipython>=8.0.0",
+    "openpyxl>=3.1.0",
+    "xlsxwriter>=3.1.0",
+    "xlwings>=0.30.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
 ]
 
 # 安装命令: pip install -e ".[dev]"
 [project.optional-dependencies]
 
-# 机器学习模型支持 (仅当用户需要用你的库跑模型时安装)
+notebook = [
+    "jupyterlab>=4.0.0"
+]
+
+# 机器学习模型支持
 ml = [
-    "xgboost>=2.0.0",
-    "lightgbm>=4.3.0",
-    "catboost>=1.2.0"
+    "xgboost>=3.0.0",
+    "lightgbm>=4.6.0",
+    "catboost>=1.2.9",
+    "statsmodels>=0.14.0",
+    "shap>=0.45.0"
+]
+
+tuning = [
+    "optuna>=4.0.0",
+    "optuna-integration>=4.0.0"
+]
+
+docs = [
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.25.0",
+    "mkdocs-git-revision-date-localized-plugin>=1.2.0",
+    "mkdocs-jupyter>=0.25.0",
 ]
 
 # 开发与测试环境
 dev = [
     "pytest>=7.4.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "pydoclint>=0.8.0",
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.25.0",
+    "mkdocs-git-revision-date-localized-plugin>=1.2.0",
+    "mkdocs-jupyter>=0.25.0",
     "black>=23.0.0",
     "jupyterlab>=4.0.0",
-    "matplotlib>=3.7.0",   # 绘图库放在这里
-    "seaborn>=0.12.0",
-    "tqdm>=4.66.0",        # 如果测试脚本需要进度条
-    "psutil>=5.9.0"        # 如果测试脚本需要监控内存
+    "tqdm>=4.66.0",        
+    "psutil>=5.9.0",
+    "statsmodels>=0.14.0",
+    "shap>=0.45.0"
 ]
 
 # 自动发现包配置
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["mars*"]        # 确保只打包 mars 开头的包
+include = ["mars*"]  
+[tool.setuptools.package-data]
+"mars" = ["py.typed"]
+"mars.analysis" = ["*.xlsx"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "D"]
+ignore = [
+    # 代码中包含 HTML/CSS/JS 模板和生成报告字符串，暂不让 E501 阻断 CI。
+    "E501",
+    # 项目大量 docstring 使用中文自然语言，不适用英文祈使句检查。
+    "D401",
+    # 中文摘要句使用中文句号，Ruff 的 D400 只识别英文句点。
+    "D400",
+    # NumPy 风格使用 D212，避免和 D213 的多行摘要空行规则互相冲突。
+    "D213",
+    # 顶层包和模块入口不承担 API 参数契约说明，避免文档噪音。
+    "D100",
+    "D104",
+    # Ruff 不强制魔术方法和 __init__ 的缺失 docstring，签名一致性由 pydoclint 兜底。
+    "D105",
+    "D107",
+    # 历史代码仍包含 typing.List/Dict/Optional/Union，触碰文件时逐步迁移。
+    "UP006",
+    "UP007",
+    "UP035",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+"benchmarks/**" = ["D"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mars"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.pydoclint]
+style = "numpy"
+check-arg-order = true
+arg-type-hints-in-docstring = true
+skip-checking-short-docstrings = true
+skip-checking-raises = false
+skip-checking-private-functions = true
+allow-init-docstring = true
+require-return-section-when-returning-nothing = false
+check-return-types = false
+require-yield-section-when-yielding-nothing = false
+check-yield-types = false
+ignore-private-args = false
+check-class-attributes = false
+should-document-star-arguments = true
+omit-stars-when-documenting-varargs = false
+check-style-mismatch = false
+check-arg-defaults = false
+
+[tool.mypy]
+python_version = "3.10"
+mypy_path = "src"
+files = ["src/mars"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+strict_equality = true
+ignore_missing_imports = true
+allow_redefinition = true
+show_error_codes = true
+pretty = true
+exclude = [
+    "^examples/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "catboost.*",
+    "lightgbm.*",
+    "matplotlib.*",
+    "optbinning.*",
+    "optuna.*",
+    "seaborn.*",
+    "shap.*",
+    "sklearn.*",
+    "statsmodels.*",
+    "xgboost.*",
+    "xlwings.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "mars.analysis.evaluator",
+    "mars.analysis.profiler",
+    "mars.analysis.report",
+    "mars.core.base",
+    "mars.feature.base",
+    "mars.feature.binner",
+    "mars.feature.native_binner",
+    "mars.feature.optimal_binner",
+    "mars.feature.selector",
+]
+disable_error_code = [
+    "arg-type",
+    "assignment",
+    "attr-defined",
+    "call-arg",
+    "has-type",
+    "index",
+    "misc",
+    "no-any-return",
+    "override",
+    "return-value",
+    "union-attr",
+    "var-annotated",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "mars.modeling.*",
+    "mars.scoring.scorecard",
+]
+disable_error_code = [
+    "no-any-return",
+    "union-attr",
+    "var-annotated",
+]

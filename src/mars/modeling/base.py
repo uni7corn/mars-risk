@@ -1,3 +1,0 @@
-
-class MarsBaseModelTuner():
-    pass

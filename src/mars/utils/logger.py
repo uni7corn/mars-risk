@@ -1,17 +1,139 @@
+"""MARS 统一日志工具。"""
+
 import logging
 import sys
-from typing import Union, Optional, Dict
+from typing import Dict, Union
 
 # 尝试导入 colorlog 以支持彩色日志输出
 # 如果环境中未安装 colorlog，将自动回退到标准无色日志
+HAS_COLORLOG: bool = False
 try:
     import colorlog
-    HAS_COLORLOG: bool = True
 except ImportError:
-    HAS_COLORLOG: bool = False
+    pass
+else:
+    HAS_COLORLOG = True
 
 # 定义单例 Logger 的名称，确保整个项目使用的是同一个日志实例
 LOGGER_NAME: str = "mars"
+CONSOLE_ENCODING: str = getattr(sys.stdout, "encoding", None) or "utf-8"
+SAFE_REPLACEMENTS: Dict[str, str] = {
+    "⚠️": "[WARN]",
+    "⚠": "[WARN]",
+    "❌": "[ERROR]",
+    "✅": "[OK]",
+    "ℹ️": "[INFO]",
+    "ℹ": "[INFO]",
+    "⚙️": "[SETUP]",
+    "⚙": "[SETUP]",
+    "📈": "[PLOT]",
+    "📊": "[REPORT]",
+    "📉": "[CHECK]",
+    "🧹": "[CLEAN]",
+    "🔄": "[TRANSFORM]",
+    "🧮": "[METRIC]",
+    "🎲": "[SAMPLE]",
+    "⏱️": "[TIMER]",
+    "⏱": "[TIMER]",
+    "∑": "[ROLLUP]",
+}
+def _sanitize_console_text(text: str) -> str:
+    """
+    清洗控制台输出文本中的高风险字符。
+
+    Parameters
+    ----------
+    text : str
+        待写入控制台的原始文本。
+
+    Returns
+    -------
+    str
+        经过编码安全处理后的文本。
+    """
+    sanitized = text
+    for src, dst in SAFE_REPLACEMENTS.items():
+        sanitized = sanitized.replace(src, dst)
+    return sanitized.encode(CONSOLE_ENCODING, errors="replace").decode(CONSOLE_ENCODING)
+
+
+class SafePlainFormatter(logging.Formatter):
+    """
+    面向普通文本控制台的安全格式化器。
+
+    Attributes
+    ----------
+    _style : logging.PercentStyle
+        ``logging.Formatter`` 内部保存的格式化样式对象。
+
+    Examples
+    --------
+    >>> formatter = SafePlainFormatter("%(levelname)s:%(message)s")
+    >>> isinstance(formatter, logging.Formatter)
+    True
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        格式化日志记录并执行编码安全转换。
+
+        Parameters
+        ----------
+        record : logging.LogRecord
+            待格式化的日志记录对象。
+
+        Returns
+        -------
+        str
+            已经过控制台编码安全处理的日志文本。
+
+        Examples
+        --------
+        >>> record = logging.LogRecord("mars", logging.INFO, __file__, 1, "ok", (), None)
+        >>> SafePlainFormatter("%(message)s").format(record)
+        'ok'
+        """
+        return _sanitize_console_text(super().format(record))
+
+
+if HAS_COLORLOG:
+    class SafeColoredFormatter(colorlog.ColoredFormatter):
+        """
+        面向彩色终端的安全格式化器。
+
+        Attributes
+        ----------
+        _style : logging.PercentStyle
+            底层 formatter 内部保存的格式化样式对象。
+
+        Examples
+        --------
+        >>> formatter = SafeColoredFormatter("%(message)s")
+        >>> isinstance(formatter, logging.Formatter)
+        True
+        """
+
+        def format(self, record: logging.LogRecord) -> str:
+            """
+            格式化彩色日志记录并执行编码安全转换。
+
+            Parameters
+            ----------
+            record : logging.LogRecord
+                待格式化的日志记录对象。
+
+            Returns
+            -------
+            str
+                已经过控制台编码安全处理的彩色日志文本。
+
+            Examples
+            --------
+            >>> record = logging.LogRecord("mars", logging.INFO, __file__, 1, "ok", (), None)
+            >>> SafeColoredFormatter("%(message)s").format(record)
+            'ok'
+            """
+            return _sanitize_console_text(super().format(record))
 
 def get_mars_logger(level: int = logging.INFO) -> logging.Logger:
     """
@@ -22,7 +144,7 @@ def get_mars_logger(level: int = logging.INFO) -> logging.Logger:
 
     Parameters
     ----------
-    level : int, optional
+    level : int
         日志的初始过滤级别 (例如 logging.INFO, logging.DEBUG)。
         默认值为 logging.INFO。
 
@@ -35,13 +157,19 @@ def get_mars_logger(level: int = logging.INFO) -> logging.Logger:
     -----
     1. **单例模式**: 如果该名称的 Logger 已经存在且包含处理器，则直接返回，不重复添加 Handler。
     2. **独立性**: 设置 `propagate=False` 防止日志向上传播到根记录器，避免被其他库的配置污染。
-    3. **样式**: 
+    3. **样式**:
        - 彩色模式: [MARS] 时间 - 级别 - 消息 (不同级别不同颜色)
        - 普通模式: [MARS] 时间 - 级别 - 消息
+
+    Examples
+    --------
+    >>> logger = get_mars_logger()
+    >>> logger.name
+    'mars'
     """
     # 获取指定名称的 logger 实例
     logger = logging.getLogger(LOGGER_NAME)
-    
+
     # ---------------------------------------------------------
     # 1. 幂等性检查 (Idempotency Check)
     # ---------------------------------------------------------
@@ -71,11 +199,11 @@ def get_mars_logger(level: int = logging.INFO) -> logging.Logger:
             'ERROR':    'red',       # 错误：红色
             'CRITICAL': 'bold_red',  # 严重：加粗红
         }
-        
+
         # 使用 colorlog 进行带颜色的格式化
         # %(log_color)s ... 切换颜色
         # %(reset)s ... 重置颜色
-        formatter = colorlog.ColoredFormatter(
+        formatter = SafeColoredFormatter(
             '%(log_color)s[MARS] %(asctime)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
             log_colors=log_colors,
@@ -84,17 +212,17 @@ def get_mars_logger(level: int = logging.INFO) -> logging.Logger:
         )
     else:
         # 回退方案：标准的无色格式化
-        formatter = logging.Formatter(
+        formatter = SafePlainFormatter(
             '[MARS] %(asctime)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
 
     # 将格式化器应用到处理器
     console_handler.setFormatter(formatter)
-    
+
     # 将处理器添加到 logger
     logger.addHandler(console_handler)
-    
+
     # ---------------------------------------------------------
     # 4. 传播控制 (Propagation Control)
     # ---------------------------------------------------------
@@ -108,15 +236,20 @@ def get_mars_logger(level: int = logging.INFO) -> logging.Logger:
 def set_log_level(level: Union[str, int]) -> None:
     """
     动态修改全局 Logger 的日志级别。
-    
-    允许在程序运行时切换日志详细程度（例如从 INFO 切换到 DEBUG 以排查问题）。
+
+    允许在程序运行时切换日志详细程度，例如从 ``INFO`` 切换到 ``DEBUG``
+    以便定位问题。
 
     Parameters
     ----------
     level : Union[str, int]
-        目标日志级别。
-        可以是 logging 常量 (如 logging.DEBUG) 
-        也可以是字符串 (如 'DEBUG', 'info', 'WARNING')。
+        目标日志级别。可以是 ``logging`` 常量，也可以是字符串形式的
+        级别名称，例如 ``"DEBUG"``、``"info"`` 或 ``"WARNING"``。
+
+    Returns
+    -------
+    None
+        函数仅修改全局 logger 与 handler 的级别。
 
     Examples
     --------
@@ -125,7 +258,7 @@ def set_log_level(level: Union[str, int]) -> None:
     >>> set_log_level('INFO')   # 恢复正常模式
     """
     logger = logging.getLogger(LOGGER_NAME)
-    
+
     # 如果传入的是字符串，尝试将其转换为 logging 的整数常量
     if isinstance(level, str):
         level_str = level.upper()
@@ -141,10 +274,10 @@ def set_log_level(level: Union[str, int]) -> None:
         final_level = levels.get(level_str, logging.INFO)
     else:
         final_level = level
-        
+
     # 修改 logger 自身的级别
     logger.setLevel(final_level)
-    
+
     # 同时修改所有 Handlers 的级别，确保过滤规则立即生效
     # 有些情况下 handler 的级别可能比 logger 高，导致修改 logger 级别无效
     for handler in logger.handlers:
